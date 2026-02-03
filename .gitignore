@@ -1,0 +1,25 @@
+# Environment
+.env
+.venv
+env/
+venv/
+PYTHONPATH
+
+# Build and Distribution
+dist/
+build/
+*.egg-info/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+*.log
+output.txt
+build_log.txt
+
+# IDEs
+.vscode/
+.idea/
