@@ -79,7 +79,37 @@ class ToolRegistry:
             raise ValueError(f"Tool '{name}' not found in registry.")
             
         adk_logger.info(f"Executing tool: {name} with args: {kwargs}")
-        return self._tools[name]["func"](**kwargs)
+        func = self._tools[name]["func"]
+        
+        # Handle both sync and async functions if called synchronously
+        if inspect.iscoroutinefunction(func):
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If already in a loop, we can't block. This is a fallback risk.
+                    adk_logger.warning(f"Sync execution of async tool '{name}' in running loop.")
+                    return asyncio.run_coroutine_threadsafe(func(**kwargs), loop).result()
+                return asyncio.run(func(**kwargs))
+            except RuntimeError:
+                return asyncio.run(func(**kwargs))
+        
+        return func(**kwargs)
+
+    async def aexecute(self, name: str, **kwargs) -> Any:
+        """
+        Asynchronously executes a registered tool by name.
+        """
+        if name not in self._tools:
+            raise ValueError(f"Tool '{name}' not found in registry.")
+            
+        adk_logger.info(f"Executing tool (async): {name} with args: {kwargs}")
+        func = self._tools[name]["func"]
+        
+        if inspect.iscoroutinefunction(func):
+            return await func(**kwargs)
+        else:
+            return func(**kwargs)
 
 # Global tool registry
 tool_registry = ToolRegistry()

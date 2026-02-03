@@ -59,9 +59,8 @@ class LiteLLMAgent(BaseAgent):
 
         self.extra_kwargs = kwargs
         
-        # Ensure model-specific parameters        # Default parallel_tool_calls if not explicitly provided
         if "parallel_tool_calls" not in self.extra_kwargs:
-            self.extra_kwargs["parallel_tool_calls"] = False
+            self.extra_kwargs["parallel_tool_calls"] = True
             
         self.sequential_tool_execution = kwargs.get("sequential_tool_execution", settings.sequential_execution)
         
@@ -92,10 +91,13 @@ class LiteLLMAgent(BaseAgent):
         messages.append(user_msg)
         
         # 3. Persist turn start
-        # Ensure messages are sanitized before first persistence
+        # Ensure messages are sanitized and tokenized before first persistence
         current_user_msg = self._sanitize_message(user_msg)
+        current_user_msg["token_count"] = ContextManager.count_tokens([current_user_msg], self.model)
+        
         if not history:
             system_msg = self._sanitize_message(messages[0])
+            system_msg["token_count"] = ContextManager.count_tokens([system_msg], self.model)
             self.memory.add_messages(actual_session_id, [system_msg, current_user_msg])
         else:
             self.memory.add_message(actual_session_id, current_user_msg)
@@ -111,9 +113,16 @@ class LiteLLMAgent(BaseAgent):
         return messages
 
     def _update_history(self, new_messages: List[Dict[str, Any]], actual_session_id: str):
-        """Persist new messages to memory."""
+        """Persist new messages to memory with token counts."""
         if new_messages:
-            sanitized = [self._sanitize_message(m) for m in new_messages]
+            sanitized = []
+            for m in new_messages:
+                s = self._sanitize_message(m)
+                # Compute token count if not already present (optimization for future turns)
+                if "token_count" not in s:
+                    s["token_count"] = ContextManager.count_tokens([s], self.model)
+                sanitized.append(s)
+                
             self.memory.add_messages(actual_session_id, sanitized)
 
     def _sanitize_message(self, message: Any) -> Dict[str, Any]:
@@ -174,9 +183,28 @@ class LiteLLMAgent(BaseAgent):
         """Determines if we should process tool calls one by one."""
         return self.sequential_tool_execution
 
-    async def _aexecute_tool(self, tool_call) -> Any:
-        # Same as _execute_tool but for async if needed in future
-        return self._execute_tool(tool_call)
+    async def _aexecute_tool(self, tool_call) -> Dict[str, Any]:
+        """Helper to execute a tool call asynchronously and return formatted result."""
+        function_name = self._get_tc_val(tool_call, "function", "name")
+        raw_args = self._get_tc_val(tool_call, "function", "arguments") or "{}"
+        
+        try:
+            if isinstance(raw_args, dict):
+                arguments = raw_args
+            else:
+                arguments = json.loads(raw_args)
+        except json.JSONDecodeError:
+            adk_logger.warning(f"Failed to parse tool arguments for {function_name}: {raw_args}")
+            arguments = {}
+            
+        result = await tool_registry.aexecute(function_name, **arguments)
+        
+        return {
+            "role": "tool",
+            "tool_call_id": self._get_tc_val(tool_call, "id"),
+            "name": function_name,
+            "content": str(result)
+        }
 
     def _get_tc_val(self, tool_call, attr, subattr=None):
         """Helper to get value from either object or dict tool call."""
@@ -307,16 +335,18 @@ class LiteLLMAgent(BaseAgent):
                 messages.append(sanitized_msg)
                 new_turns.append(sanitized_msg)
                 
-                for tool_call in tool_calls_to_process:
-                    result = self._execute_tool(tool_call)
-                    tool_response = {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.function.name,
-                        "content": str(result)
-                    }
-                    messages.append(tool_response)
-                    new_turns.append(tool_response)
+                if self._should_handle_sequentially():
+                    for tool_call in tool_calls_to_process:
+                        result = await self._aexecute_tool(tool_call)
+                        messages.append(result)
+                        new_turns.append(result)
+                else:
+                    # Parallel Execution
+                    import asyncio
+                    results = await asyncio.gather(*[self._aexecute_tool(tc) for tc in tool_calls_to_process])
+                    for res in results:
+                        messages.append(res)
+                        new_turns.append(res)
                 continue
             
             final_msg = self._sanitize_message(message)
@@ -531,16 +561,17 @@ class LiteLLMAgent(BaseAgent):
                 messages.append(assistant_msg)
                 new_turns.append(assistant_msg)
                 
-                for tool_call in tool_calls:
-                    result = self._execute_tool(tool_call)
-                    tool_resp = {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": tool_call["function"]["name"],
-                        "content": str(result)
-                    }
-                    messages.append(tool_resp)
-                    new_turns.append(tool_resp)
+                if self._should_handle_sequentially():
+                    for tool_call in tool_calls:
+                        result = await self._aexecute_tool(tool_call)
+                        messages.append(result)
+                        new_turns.append(result)
+                else:
+                    import asyncio
+                    results = await asyncio.gather(*[self._aexecute_tool(tc) for tc in tool_calls])
+                    for res in results:
+                        messages.append(res)
+                        new_turns.append(res)
                 continue
             
             final_msg = self._sanitize_message({"role": "assistant", "content": full_content})

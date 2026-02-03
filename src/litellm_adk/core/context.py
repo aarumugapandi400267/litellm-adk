@@ -11,8 +11,12 @@ class ContextManager:
     def count_tokens(messages: List[Dict[str, Any]], model: str) -> int:
         """
         Calculate the number of tokens in a list of messages.
-        Uses LiteLLM's token_counter for multi-provider support.
+        Uses cached 'token_count' if available, otherwise LiteLLM's token_counter.
         """
+        # optimization: if it's a single message with a cached count, use it
+        if len(messages) == 1 and "token_count" in messages[0]:
+            return messages[0]["token_count"]
+            
         try:
             # Pass a copy to avoid any potential in-place modifications by token_counter
             return litellm.token_counter(model=model, messages=[m.copy() for m in messages])
@@ -44,24 +48,26 @@ class ContextManager:
             other_messages = messages
 
         # 2. Calculate Budget
-        # Ensure reserve_tokens doesn't eat the whole budget for small limits
         actual_reserve = min(reserve_tokens, int(max_tokens * 0.2))
         allowed_tokens = max_tokens - actual_reserve
         
         if system_prompt:
             allowed_tokens -= ContextManager.count_tokens([system_prompt], model)
 
-        # 3. Truncate (Keeping the LATEST messages)
+        # 3. Quick Check: Is truncation even needed?
+        # This one call avoids the N calls in the loop below for most turns
+        if ContextManager.count_tokens(other_messages, model) <= allowed_tokens:
+            return messages
+
+        # 4. Truncate (Keeping the LATEST messages)
         truncated = []
         current_tokens = 0
         
-        # Always keep at least the latest message (the current query)
         if other_messages:
             last_msg = other_messages[-1]
             truncated.append(last_msg)
             current_tokens += ContextManager.count_tokens([last_msg], model)
             
-            # Work backwards from the second to last message
             for msg in reversed(other_messages[:-1]):
                 msg_tokens = ContextManager.count_tokens([msg], model)
                 if current_tokens + msg_tokens > allowed_tokens:
@@ -69,7 +75,7 @@ class ContextManager:
                 truncated.insert(0, msg)
                 current_tokens += msg_tokens
 
-        # 4. Reconstruct
+        # 5. Reconstruct
         result = []
         if system_prompt:
             result.append(system_prompt)
