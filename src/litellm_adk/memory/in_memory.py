@@ -3,10 +3,11 @@ from .base import BaseMemory
 
 class InMemoryMemory(BaseMemory):
     """
-    Standard in-memory store for conversation history.
+    Standard in-memory store for conversation history and session metadata.
     """
     def __init__(self):
         self._storage: Dict[str, List[Dict[str, Any]]] = {}
+        self._metadata: Dict[str, Dict[str, Any]] = {}
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         return self._storage.get(session_id, []).copy()
@@ -24,3 +25,11 @@ class InMemoryMemory(BaseMemory):
     def clear(self, session_id: str):
         if session_id in self._storage:
             self._storage[session_id] = []
+        if session_id in self._metadata:
+            self._metadata[session_id] = {}
+
+    def get_session_metadata(self, session_id: str) -> Dict[str, Any]:
+        return self._metadata.get(session_id, {}).copy()
+
+    def save_session_metadata(self, session_id: str, metadata: Dict[str, Any]):
+        self._metadata[session_id] = metadata.copy()

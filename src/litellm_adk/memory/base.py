@@ -25,3 +25,13 @@ class BaseMemory(ABC):
     def clear(self, session_id: str):
         """Clear history for a session."""
         pass
+
+    @abstractmethod
+    def get_session_metadata(self, session_id: str) -> Dict[str, Any]:
+        """Retrieve metadata/state for a given session."""
+        pass
+
+    @abstractmethod
+    def save_session_metadata(self, session_id: str, metadata: Dict[str, Any]):
+        """Save/Update metadata/state for a given session."""
+        pass

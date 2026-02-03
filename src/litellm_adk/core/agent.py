@@ -4,9 +4,11 @@ from typing import List, Dict, Any, Optional, Union, Generator, AsyncGenerator
 from .base import BaseAgent
 from ..observability.logger import adk_logger
 from ..config.settings import settings
+from ..session import Session
 from ..tools.registry import tool_registry
 from ..memory.base import BaseMemory
 from ..memory.in_memory import InMemoryMemory
+from .context import ContextManager
 import uuid
 
 # Global LiteLLM configuration for resilience
@@ -25,7 +27,7 @@ class LiteLLMAgent(BaseAgent):
         system_prompt: str = "You are a helpful assistant.",
         tools: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[BaseMemory] = None,
-        session_id: Optional[str] = None,
+        max_context_tokens: Optional[int] = None,
         **kwargs
     ):
         self.model = model or settings.model
@@ -65,63 +67,86 @@ class LiteLLMAgent(BaseAgent):
         
         # Memory Persistence
         self.memory = memory or InMemoryMemory()
-        self.session_id = session_id or str(uuid.uuid4())
-        self.history = self.memory.get_messages(self.session_id)
+        self.max_context_tokens = max_context_tokens
         
-        if not self.history:
-            self.history = [{"role": "system", "content": self.system_prompt}]
-            self.memory.add_message(self.session_id, self.history[0])
-            
-        adk_logger.debug(f"Initialized LiteLLMAgent with session_id={self.session_id}, model={self.model}")
+        adk_logger.debug(f"Initialized LiteLLMAgent as a service for model={self.model}")
 
-    def _prepare_messages(self, prompt: str) -> List[Dict[str, str]]:
-        # Refresh from memory in case it was modified elsewhere
-        self.history = self.memory.get_messages(self.session_id)
+    def save_session(self, session: Union[str, Session]):
+        """Persist session metadata and state to memory."""
+        actual_id = session.id if isinstance(session, Session) else session
         
-        messages = self.history.copy()
+        # If it's a Session object, we dump the full metadata
+        if isinstance(session, Session):
+            self.memory.save_session_metadata(actual_id, session.model_dump())
+        # If it's just an ID, there's nothing to dump from the service layer
+
+    def _prepare_messages(self, prompt: str, actual_session_id: str) -> List[Dict[str, str]]:
+        # 2. Fetch/Initialize History from Memory
+        history = self.memory.get_messages(actual_session_id)
+        if not history:
+            history = [{"role": "system", "content": self.system_prompt}]
+            # Don't persist system prompt until first real turn to keep DB clean
+            
+        messages = history.copy()
         user_msg = {"role": "user", "content": prompt}
         messages.append(user_msg)
         
-        # Persist the user message immediately
-        self.memory.add_message(self.session_id, user_msg)
-        self.history.append(user_msg)
+        # 3. Persist turn start
+        # Ensure messages are sanitized before first persistence
+        current_user_msg = self._sanitize_message(user_msg)
+        if not history:
+            system_msg = self._sanitize_message(messages[0])
+            self.memory.add_messages(actual_session_id, [system_msg, current_user_msg])
+        else:
+            self.memory.add_message(actual_session_id, current_user_msg)
         
+        # 4. Context Management (Truncation)
+        if self.max_context_tokens:
+            messages = ContextManager.truncate_history(
+                messages, 
+                self.model, 
+                self.max_context_tokens
+            )
+            
         return messages
 
-    def _update_history(self, final_messages: List[Dict[str, Any]]):
-        """Sync internal history and memory with the final message state."""
-        # Find which messages were added since we prepared (the user message was already added)
-        # We assume messages order is preserved
-        start_idx = len(self.history)
-        new_messages = [self._sanitize_message(m) for m in final_messages[start_idx:]]
-        
+    def _update_history(self, new_messages: List[Dict[str, Any]], actual_session_id: str):
+        """Persist new messages to memory."""
         if new_messages:
-            self.memory.add_messages(self.session_id, new_messages)
-            self.history.extend(new_messages)
+            sanitized = [self._sanitize_message(m) for m in new_messages]
+            self.memory.add_messages(actual_session_id, sanitized)
 
     def _sanitize_message(self, message: Any) -> Dict[str, Any]:
-        """Convert LiteLLM message objects to plain dictionaries for serialization."""
-        if isinstance(message, dict):
-            # Still need to sanitize tool_calls inside if they are objects
-            if "tool_calls" in message and message["tool_calls"]:
-                message["tool_calls"] = [self._sanitize_tool_call(tc) for tc in message["tool_calls"]]
-            return message
+        """
+        Convert LiteLLM message objects to strictly compliant dictionaries.
+        Ensures compatibility with strict providers like OCI.
+        """
+        # If it's already a dict, extract only what we need to avoid 'extra key' errors
+        role = getattr(message, "role", "assistant") if not isinstance(message, dict) else message.get("role", "assistant")
+        content = getattr(message, "content", "") if not isinstance(message, dict) else message.get("content", "")
         
-        # Manually extract common fields to ensure clean JSON
+        # OCI/OpenAI standard: content cannot be None for assistant/user/system
+        if content is None:
+            content = ""
+            
         msg_dict = {
-            "role": getattr(message, "role", "assistant"),
-            "content": getattr(message, "content", None)
+            "role": role,
+            "content": content
         }
         
-        if hasattr(message, "name") and message.name:
-            msg_dict["name"] = message.name
+        # Handle Tool Calls (Assistant Message)
+        tool_calls = getattr(message, "tool_calls", None) if not isinstance(message, dict) else message.get("tool_calls")
+        if tool_calls:
+            msg_dict["tool_calls"] = [self._sanitize_tool_call(tc) for tc in tool_calls]
             
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            msg_dict["tool_calls"] = [self._sanitize_tool_call(tc) for tc in message.tool_calls]
-            
-        if hasattr(message, "tool_call_id") and message.tool_call_id:
-            msg_dict["tool_call_id"] = message.tool_call_id
-            
+        # Handle Tool Result (Tool Role)
+        if role == "tool":
+            msg_dict["tool_call_id"] = getattr(message, "tool_call_id", None) if not isinstance(message, dict) else message.get("tool_call_id")
+            # Name is optional but good practice
+            name = getattr(message, "name", None) if not isinstance(message, dict) else message.get("name")
+            if name:
+                msg_dict["name"] = name
+                
         return msg_dict
 
     def _sanitize_tool_call(self, tc: Any) -> Dict[str, Any]:
@@ -193,12 +218,14 @@ class LiteLLMAgent(BaseAgent):
         
         return tool_registry.execute(function_name, **arguments)
 
-    def invoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, **kwargs) -> str:
+    def invoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> str:
         """
         Execute a synchronous completion with automatic tool calling.
         """
-        messages = self._prepare_messages(prompt)
+        actual_session_id = session_id.id if isinstance(session_id, Session) else (session_id or str(uuid.uuid4()))
+        messages = self._prepare_messages(prompt, actual_session_id=actual_session_id)
         tools = tools or self.tools
+        new_turns = [] # Track only what's new in this specific call
         
         adk_logger.info(f"Invoking completion for model: {self.model}")
         
@@ -216,39 +243,45 @@ class LiteLLMAgent(BaseAgent):
             
             # Check if the model wants to call tools
             if hasattr(message, "tool_calls") and message.tool_calls:
-                # If sequential is enabled, we only process the FIRST tool call
                 tool_calls_to_process = [message.tool_calls[0]] if self._should_handle_sequentially() else message.tool_calls
                 
-                # We update the original message to only include the calls we are handling 
-                # (to keep history clean for strict models)
                 if self._should_handle_sequentially():
                     message.tool_calls = tool_calls_to_process
 
                 sanitized_msg = self._sanitize_message(message)
                 messages.append(sanitized_msg)
+                new_turns.append(sanitized_msg)
                 
                 for tool_call in tool_calls_to_process:
                     result = self._execute_tool(tool_call)
                     
-                    messages.append({
+                    tool_response = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.function.name,
                         "content": str(result)
-                    })
+                    }
+                    messages.append(tool_response)
+                    new_turns.append(tool_response)
                 
                 continue
             
-            messages.append(self._sanitize_message(message))
-            self._update_history(messages)
-            return message.content
+            final_msg = self._sanitize_message(message)
+            messages.append(final_msg)
+            new_turns.append(final_msg)
+            
+            # Persist only the new assistant/tool turns
+            self._update_history(new_turns, actual_session_id=actual_session_id)
+            return final_msg.get("content")
 
-    async def ainvoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, **kwargs) -> str:
+    async def ainvoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> str:
         """
         Execute an asynchronous completion with automatic tool calling.
         """
-        messages = self._prepare_messages(prompt)
+        actual_session_id = session_id.id if isinstance(session_id, Session) else (session_id or str(uuid.uuid4()))
+        messages = self._prepare_messages(prompt, actual_session_id=actual_session_id)
         tools = tools or self.tools
+        new_turns = []
         
         adk_logger.info(f"Invoking async completion for model: {self.model}")
         
@@ -272,27 +305,36 @@ class LiteLLMAgent(BaseAgent):
 
                 sanitized_msg = self._sanitize_message(message)
                 messages.append(sanitized_msg)
+                new_turns.append(sanitized_msg)
                 
                 for tool_call in tool_calls_to_process:
                     result = self._execute_tool(tool_call)
-                    messages.append({
+                    tool_response = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.function.name,
                         "content": str(result)
-                    })
+                    }
+                    messages.append(tool_response)
+                    new_turns.append(tool_response)
                 continue
             
-            messages.append(self._sanitize_message(message))
-            self._update_history(messages)
-            return message.content
+            final_msg = self._sanitize_message(message)
+            messages.append(final_msg)
+            new_turns.append(final_msg)
+            
+            self._update_history(new_turns, actual_session_id=actual_session_id)
+            return final_msg.get("content")
 
-    def stream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, **kwargs) -> Generator[str, None, None]:
+    def stream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> Generator[str, None, None]:
         """
         Execute a streaming completion with automatic tool calling.
         """
-        messages = self._prepare_messages(prompt)
+        actual_session_id = session_id.id if isinstance(session_id, Session) else (session_id or str(uuid.uuid4()))
+        messages = self._prepare_messages(prompt, actual_session_id=actual_session_id)
         tools = tools or self.tools
+        
+        new_turns = []
         
         while True:
             response = litellm.completion(
@@ -356,7 +398,7 @@ class LiteLLMAgent(BaseAgent):
                                     if last_tc.function.arguments is None:
                                         last_tc.function.arguments = ""
                                     last_tc.function.arguments += tc_delta.function.arguments
-
+  
             # Build final flattened tool calls list (as dicts for history)
             tool_calls = []
             for idx in sorted(tool_calls_by_index.keys()):
@@ -370,39 +412,46 @@ class LiteLLMAgent(BaseAgent):
                                 "arguments": tc_obj.function.arguments
                             }
                         })
-
+  
             if tool_calls:
                 # If sequential, only keep the first tool call
                 if self._should_handle_sequentially():
                     tool_calls = [tool_calls[0]]
-
+  
                 # Add the assistant's composite tool call message to history
-                assistant_msg = {"role": "assistant", "tool_calls": tool_calls, "content": full_content or None}
+                assistant_msg = self._sanitize_message({"role": "assistant", "tool_calls": tool_calls, "content": full_content})
                 messages.append(assistant_msg)
+                new_turns.append(assistant_msg)
                 
                 for tool_call in tool_calls:
                     result = self._execute_tool(tool_call)
-                    messages.append({
+                    tool_resp = {
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "name": tool_call["function"]["name"],
                         "content": str(result)
-                    })
+                    }
+                    messages.append(tool_resp)
+                    new_turns.append(tool_resp)
                 
                 # Loop back to continue the conversation with tool results
                 continue
             
             # No tool calls, store final content and finish
-            messages.append({"role": "assistant", "content": full_content})
-            self._update_history(messages)
+            final_msg = self._sanitize_message({"role": "assistant", "content": full_content})
+            messages.append(final_msg)
+            new_turns.append(final_msg)
+            self._update_history(new_turns, actual_session_id=actual_session_id)
             return
 
-    async def astream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, **kwargs) -> AsyncGenerator[str, None]:
+    async def astream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> AsyncGenerator[str, None]:
         """
         Execute an asynchronous streaming completion with automatic tool calling.
         """
-        messages = self._prepare_messages(prompt)
+        actual_session_id = session_id.id if isinstance(session_id, Session) else (session_id or str(uuid.uuid4()))
+        messages = self._prepare_messages(prompt, actual_session_id=actual_session_id)
         tools = tools or self.tools
+        new_turns = []
         
         while True:
             response = await litellm.acompletion(
@@ -460,7 +509,7 @@ class LiteLLMAgent(BaseAgent):
                                     if last_tc.function.arguments is None:
                                         last_tc.function.arguments = ""
                                     last_tc.function.arguments += tc_delta.function.arguments
-
+  
             tool_calls = []
             for idx in sorted(tool_calls_by_index.keys()):
                 for tc_obj in tool_calls_by_index[idx]:
@@ -473,24 +522,29 @@ class LiteLLMAgent(BaseAgent):
                                 "arguments": tc_obj.function.arguments
                             }
                         })
-
+  
             if tool_calls:
                 if self._should_handle_sequentially():
                     tool_calls = [tool_calls[0]]
-
-                assistant_msg = {"role": "assistant", "tool_calls": tool_calls, "content": full_content or None}
+  
+                assistant_msg = self._sanitize_message({"role": "assistant", "tool_calls": tool_calls, "content": full_content})
                 messages.append(assistant_msg)
+                new_turns.append(assistant_msg)
                 
                 for tool_call in tool_calls:
                     result = self._execute_tool(tool_call)
-                    messages.append({
+                    tool_resp = {
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "name": tool_call["function"]["name"],
                         "content": str(result)
-                    })
+                    }
+                    messages.append(tool_resp)
+                    new_turns.append(tool_resp)
                 continue
             
-            messages.append({"role": "assistant", "content": full_content})
-            self._update_history(messages)
+            final_msg = self._sanitize_message({"role": "assistant", "content": full_content})
+            messages.append(final_msg)
+            new_turns.append(final_msg)
+            self._update_history(new_turns, actual_session_id=actual_session_id)
             return

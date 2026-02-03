@@ -4,7 +4,7 @@ import pymongo
 
 class MongoDBMemory(BaseMemory):
     """
-    MongoDB-based persistence for conversation history.
+    MongoDB-based persistence for conversation history and session metadata.
     """
     def __init__(
         self, 
@@ -21,8 +21,6 @@ class MongoDBMemory(BaseMemory):
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         doc = self.collection.find_one({"session_id": session_id})
         if doc:
-            # MongoDB returns a list of dicts, but we need to ensure 
-            # we return a copy to prevent in-place modifications
             return list(doc.get("messages", []))
         return []
 
@@ -43,5 +41,18 @@ class MongoDBMemory(BaseMemory):
     def clear(self, session_id: str):
         self.collection.update_one(
             {"session_id": session_id},
-            {"$set": {"messages": []}}
+            {"$set": {"messages": [], "metadata": {}}}
+        )
+
+    def get_session_metadata(self, session_id: str) -> Dict[str, Any]:
+        doc = self.collection.find_one({"session_id": session_id})
+        if doc:
+            return doc.get("metadata", {})
+        return {}
+
+    def save_session_metadata(self, session_id: str, metadata: Dict[str, Any]):
+        self.collection.update_one(
+            {"session_id": session_id},
+            {"$set": {"metadata": metadata}},
+            upsert=True
         )
