@@ -17,6 +17,7 @@ async def run_demo():
         api_key="sk-1234",
         base_url="http://localhost:9000/v1",
         tools=[get_stock_price, get_company_news],
+        memory=InMemoryMemory(),
         max_context_tokens=1000
     )
 
