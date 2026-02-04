@@ -11,24 +11,25 @@ class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, Dict[str, Any]] = {}
 
-    def register(self, name_or_func: Any = None):
+    from typing import Union
+    def register(self, name_or_func: Any = None, requires_approval: Union[bool, Callable[[Dict[str, Any]], bool]] = False):
         """
         Decorator to register a function as a tool.
-        Supports both @tool and @tool(name="...")
+        Supports both @tool and @tool(name="...", requires_approval=True)
         """
         if callable(name_or_func):
-            self._register_function(name_or_func)
+            self._register_function(name_or_func, requires_approval=requires_approval)
             return name_or_func
 
         def decorator(func: Callable):
-            self._register_function(func, name_or_func)
+            self._register_function(func, name_or_func, requires_approval=requires_approval)
             return func
         return decorator
 
-    def _register_function(self, func: Callable, name: Optional[str] = None) -> Dict[str, Any]:
+    def _register_function(self, func: Callable, name: Optional[str] = None, description: Optional[str] = None, requires_approval: Union[bool, Callable[[Dict[str, Any]], bool]] = False) -> Dict[str, Any]:
         """Internal helper to register a function and return its definition."""
         tool_name = name or func.__name__
-        description = func.__doc__ or f"Tool: {tool_name}"
+        tool_description = description or func.__doc__ or f"Tool: {tool_name}"
         
         sig = inspect.signature(func)
         parameters = {}
@@ -48,7 +49,7 @@ class ToolRegistry:
             "type": "function",
             "function": {
                 "name": tool_name,
-                "description": description.strip(),
+                "description": tool_description.strip(),
                 "parameters": {
                     "type": "object",
                     "properties": parameters,
@@ -57,12 +58,19 @@ class ToolRegistry:
             }
         }
         
+        # If already registered and no explicit approval flag provided, keep the existing one
+        existing = self._tools.get(tool_name)
+        final_approval = requires_approval
+        if existing and requires_approval is False:
+             final_approval = existing.get("requires_approval", False)
+
         self._tools[tool_name] = {
             "name": tool_name,
             "func": func,
-            "definition": definition
+            "definition": definition,
+            "requires_approval": final_approval
         }
-        adk_logger.debug(f"Registered tool: {tool_name}")
+        adk_logger.debug(f"Registered tool: {tool_name} (approval={final_approval})")
         return definition
 
     def get_tool_definitions(self) -> List[Dict[str, Any]]:

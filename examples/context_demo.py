@@ -1,50 +1,47 @@
 import asyncio
-from litellm_adk import LiteLLMAgent
-from litellm_adk.session import Session
-from litellm_adk.memory import InMemoryMemory
-from litellm_adk.tools import tool
+from litellm_adk import LiteLLMAgent, tool
 
 async def main():
-    # 1. Setup small context limit (e.g. 200 tokens) to force truncation
-
+    # 1. Setup small context limit (e.g. 400 tokens) to force truncation
     @tool
-    def get_weather(city):
+    def get_weather(city: str):
+        """Get weather info."""
         return f"The weather in {city} is sunny."
 
     agent = LiteLLMAgent(
         model="oci/xai.grok-3",
         api_key="sk-1234",
         base_url="http://localhost:9000/v1",
-        max_context_tokens=1000, # Small limit for Grok/OAI counting
-        system_prompt="You are a poet who remembers colors.",
+        max_context_tokens=400, # Small limit to trigger context window management
+        system_prompt="You are a helpful assistant. Keep your answers brief.",
         tools=[get_weather],
     )
 
-    session_id = "color-chat"
-    
-    print(f"--- Context Truncation Demo ---")
+    try:
+        session_id = "truncation-test"
+        print(f"--- 🧱 Context Truncation Demo (Limit: 400 Tokens) ---")
 
-    # Turn 1: Add some context
-    # print("\n[Turn 1]")
-    # await agent.ainvoke("My favorite color is Blue.", session_id=session_id)
-    # print("User: wHAT IS THE WEATHER IN NEW YORK?")
+        # Turn 1: Save a secret
+        print("\n[Turn 1] User: My favorite color is 'Indigo'.")
+        await agent.ainvoke("My favorite color is 'Indigo'.", session_id=session_id)
 
-    # # Turn 2: Add more context
-    # print("\n[Turn 2]")
-    # await agent.ainvoke("My second favorite color is Red.", session_id=session_id)
-    # print("User: My second favorite color is Red.")
+        # Turn 2: Noise to fill context
+        print("[Turn 2] User: What is the weather in NYC?")
+        await agent.ainvoke("What is the weather in NYC?", session_id=session_id)
 
-    # # Turn 3: Add more context to push the limit
-    # print("\n[Turn 3]")
-    # long_text = "The quick brown fox jumps over the lazy dog. "
-    # await agent.ainvoke(f"Repeat this text: {long_text}", session_id=session_id)
-    # print("User: (Sent a long text to push the limit)")
+        # Turn 3: Large text to push Turn 1 out of the window
+        noise = "The quick brown fox jumps over the lazy dog. " * 15
+        print(f"[Turn 3] User: (Sending 300+ tokens of noise...)")
+        await agent.ainvoke(f"Just summarize this briefly: {noise}", session_id=session_id)
 
-    # # Turn 4: Check if the agent remembers the FIRST color
-    # # If truncation worked, 'Blue' should be gone, but 'Red' (more recent) might stay.
-    # print("\n[Turn 4]")
-    response = await agent.ainvoke("Weather in Chennai.", session_id=session_id)
-    print(f"Agent: {response}")
+        # Turn 4: Final verification
+        print("\n[Turn 4] User: What was my favorite color from Turn 1?")
+        response = await agent.ainvoke("What was my favorite color from Turn 1?", session_id=session_id)
+        print(f"Agent: {response}")
+        print("\n(Note: If Turn 1 were truncated, the agent might say it doesn't know.)")
+
+    finally:
+        await agent.aclose()
 
 if __name__ == "__main__":
     asyncio.run(main())

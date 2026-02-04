@@ -1,15 +1,22 @@
+import uuid
 import litellm
 import json
-from typing import List, Dict, Any, Optional, Union, Generator, AsyncGenerator
+import logging
+import asyncio
+from types import SimpleNamespace
+from typing import List, Dict, Any, Optional, Union, Callable, Generator, AsyncGenerator
+
 from .base import BaseAgent
 from ..observability.logger import adk_logger
 from ..config.settings import settings
 from ..session import Session
 from ..tools.registry import tool_registry
-from ..memory.base import BaseMemory
-from ..memory.in_memory import InMemoryMemory
+from ..memory import BaseMemory, InMemoryMemory
+from ..memory.vector_store import VectorStore
 from .context import ContextManager
-import uuid
+from .approval import ApprovalManager
+from .models import ApprovalStatus, ApprovalRequest
+from .policy import PolicyEngine
 
 # Global LiteLLM configuration for resilience
 litellm.drop_params = True
@@ -18,6 +25,45 @@ class LiteLLMAgent(BaseAgent):
     """
     Multiservice agent supporting dynamic overrides for base_url and api_key.
     """
+
+    @classmethod
+    async def aclose(cls):
+        """
+        Properly close all global litellm async clients and clear caches.
+        This provides a structural resolution to the 'coroutine never awaited' 
+        warning often seen on Windows at script exit.
+        """
+        try:
+            await litellm.close_litellm_async_clients()
+            # Clear the internal cache to prevent litellm's own broken exit-cleanup from running
+            if hasattr(litellm, "in_memory_llm_clients_cache"):
+                cache = litellm.in_memory_llm_clients_cache
+                if hasattr(cache, "cache_dict"):
+                    cache.cache_dict.clear()
+            
+            # Structural Resolution: Patch litellm's cleanup to be a no-op 
+            # This prevents its internal atexit handler from creating un-awaited coroutines
+            import litellm.llms.custom_httpx.async_client_cleanup as cleanup_mod
+            import asyncio
+            
+            # We return a completed future so that run_until_complete(close_...) still works
+            # but doesn't actually start any new async work or leave coroutines hanging.
+            def sync_noop(*args, **kwargs):
+                f = asyncio.Future()
+                f.set_result(None)
+                return f
+            
+            cleanup_mod.close_litellm_async_clients = sync_noop
+            
+            adk_logger.debug("Global LiteLLM async clients closed and cache cleared.")
+        except Exception as e:
+            adk_logger.debug(f"Error during LiteLLM cleanup: {e}")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.aclose()
 
     def __init__(
         self,
@@ -28,11 +74,14 @@ class LiteLLMAgent(BaseAgent):
         tools: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[BaseMemory] = None,
         max_context_tokens: Optional[int] = None,
+        fallbacks: Optional[List[Union[str, Dict[str, Any]]]] = None,
+        vector_store: Optional['VectorStore'] = None,
         **kwargs
     ):
         self.model = model or settings.model
         self.api_key = api_key or settings.api_key
         self.base_url = base_url or settings.base_url
+        self.vector_store = vector_store
         
         # Automatically prepend 'openai/' if a base_url is used to force proxy/OpenAI-compatible routing
         if self.base_url and not self.model.startswith("openai/"):
@@ -57,16 +106,32 @@ class LiteLLMAgent(BaseAgent):
                     processed_tools.append(t)
             self.tools = processed_tools
 
+        # Core config extraction
+        self.approval_manager = kwargs.pop("approval_manager", None) or ApprovalManager()
+        self.policy_engine = kwargs.pop("policy_engine", None) or PolicyEngine()
+        self.sequential_tool_execution = kwargs.pop("sequential_tool_execution", settings.sequential_execution)
+
         self.extra_kwargs = kwargs
         
         if "parallel_tool_calls" not in self.extra_kwargs:
             self.extra_kwargs["parallel_tool_calls"] = True
             
-        self.sequential_tool_execution = kwargs.get("sequential_tool_execution", settings.sequential_execution)
-        
         # Memory Persistence
         self.memory = memory or InMemoryMemory()
         self.max_context_tokens = max_context_tokens
+        
+        # Process fallbacks: ensure they are standardized
+        self.fallbacks = []
+        if fallbacks:
+            for f in fallbacks:
+                config = {"model": f} if isinstance(f, str) else f.copy()
+                
+                # Apply model prefixing to fallbacks if using custom base_url (and fallback doesn't override it)
+                target_base_url = config.get("base_url", self.base_url)
+                if target_base_url and not config["model"].startswith("openai/"):
+                    config["model"] = f"openai/{config['model']}"
+                    
+                self.fallbacks.append(config)
         
         adk_logger.debug(f"Initialized LiteLLMAgent as a service for model={self.model}")
 
@@ -79,28 +144,76 @@ class LiteLLMAgent(BaseAgent):
             self.memory.save_session_metadata(actual_id, session.model_dump())
         # If it's just an ID, there's nothing to dump from the service layer
 
+    # --- HITL Convenience Methods ---
+    def approve(self, request_id: str, reviewer: str = "human", reason: Optional[str] = None):
+        """Approve a pending tool call."""
+        self.approval_manager.submit_decision(request_id, ApprovalStatus.APPROVED, reviewer, reason)
+
+    def reject(self, request_id: str, reviewer: str = "human", reason: Optional[str] = None):
+        """Reject a pending tool call."""
+        self.approval_manager.submit_decision(request_id, ApprovalStatus.REJECTED, reviewer, reason)
+
+    def modify(self, request_id: str, modified_args: Dict[str, Any], reviewer: str = "human", reason: Optional[str] = None):
+        """Provide modified arguments and approve the tool call."""
+        self.approval_manager.submit_decision(request_id, ApprovalStatus.MODIFIED, reviewer, reason, modified_args)
+
+    async def _retrieve_context(self, prompt: str) -> Optional[str]:
+        """Async semantic search for relevant context."""
+        if not self.vector_store or not prompt:
+            return None
+        
+        try:
+            results = await self.vector_store.search(prompt, k=3)
+            if not results:
+                return None
+            
+            context_block = "\n".join([f"- {r['text']}" for r in results])
+            return f"Relevant Context from Memory:\n{context_block}"
+        except Exception as e:
+            adk_logger.warning(f"Vector retrieval failed: {e}")
+            return None
+
     def _prepare_messages(self, prompt: str, actual_session_id: str) -> List[Dict[str, str]]:
         # 2. Fetch/Initialize History from Memory
         history = self.memory.get_messages(actual_session_id)
-        if not history:
+        is_new_session = not history
+        
+        if is_new_session:
             history = [{"role": "system", "content": self.system_prompt}]
             # Don't persist system prompt until first real turn to keep DB clean
             
         messages = history.copy()
-        user_msg = {"role": "user", "content": prompt}
-        messages.append(user_msg)
-        
-        # 3. Persist turn start
-        # Ensure messages are sanitized and tokenized before first persistence
-        current_user_msg = self._sanitize_message(user_msg)
-        current_user_msg["token_count"] = ContextManager.count_tokens([current_user_msg], self.model)
-        
-        if not history:
-            system_msg = self._sanitize_message(messages[0])
-            system_msg["token_count"] = ContextManager.count_tokens([system_msg], self.model)
-            self.memory.add_messages(actual_session_id, [system_msg, current_user_msg])
-        else:
-            self.memory.add_message(actual_session_id, current_user_msg)
+        if prompt:
+            # 2a. Vector Retrieval (Semantic Search)
+            if self.vector_store:
+                try:
+                    # Search logic inside _prepare_messages might be blocking in sync invoke, 
+                    # but wait, vector_store.search is async.
+                    # LiteLLMAgent methods are invoke(sync) and ainvoke(async).
+                    # 'invoke' cannot await. So VectorStore mostly supports async agents.
+                    # We will only support it for async invoke for now or use asyncio.run/loop for sync (risky).
+                    # Actually, for simplicity in 'prepare_messages' which is sync:
+                    # We might need to skip distinct vector search here or make prepare_messages async?
+                    # But prepare_messages is called by sync invoke. 
+                    # Let's put a TODO/Warning for sync usage or assume async usage is primary.
+                    pass
+                except Exception as e:
+                     adk_logger.warning(f"Vector search failed: {e}")
+
+            user_msg = {"role": "user", "content": prompt}
+            messages.append(user_msg)
+            
+            # 3. Persist turn start
+            # Ensure messages are sanitized and tokenized before first persistence
+            current_user_msg = self._sanitize_message(user_msg)
+            current_user_msg["token_count"] = ContextManager.count_tokens([current_user_msg], self.model)
+            
+            if is_new_session:
+                system_msg = self._sanitize_message(messages[0])
+                system_msg["token_count"] = ContextManager.count_tokens([system_msg], self.model)
+                self.memory.add_messages(actual_session_id, [system_msg, current_user_msg])
+            else:
+                self.memory.add_message(actual_session_id, current_user_msg)
         
         # 4. Context Management (Truncation)
         if self.max_context_tokens:
@@ -183,28 +296,63 @@ class LiteLLMAgent(BaseAgent):
         """Determines if we should process tool calls one by one."""
         return self.sequential_tool_execution
 
+    def _should_require_approval(self, tool_name: str, arguments: Dict[str, Any]) -> bool:
+        """Centralized check for tool approval requirements."""
+        # 1. Check registry flag (can be bool OR predicate)
+        from ..tools.registry import tool_registry
+        registry_meta = tool_registry._tools.get(tool_name, {})
+        req = registry_meta.get("requires_approval")
+        
+        if callable(req):
+            if req(arguments): return True
+        elif req is True:
+            return True
+            
+        # 2. Check Policy Engine rules
+        if self.policy_engine.should_require_approval(tool_name, arguments):
+            return True
+            
+        return False
+
     async def _aexecute_tool(self, tool_call) -> Dict[str, Any]:
         """Helper to execute a tool call asynchronously and return formatted result."""
         function_name = self._get_tc_val(tool_call, "function", "name")
         raw_args = self._get_tc_val(tool_call, "function", "arguments") or "{}"
+        t_id = self._get_tc_val(tool_call, "id")
         
-        try:
-            if isinstance(raw_args, dict):
-                arguments = raw_args
-            else:
-                arguments = json.loads(raw_args)
-        except json.JSONDecodeError:
-            adk_logger.warning(f"Failed to parse tool arguments for {function_name}: {raw_args}")
-            arguments = {}
-            
-        result = await tool_registry.aexecute(function_name, **arguments)
-        
+        arguments = self._parse_arguments(raw_args)
+        return await self._aexecute_tool_with_args(function_name, t_id, arguments)
+
+    async def _aexecute_tool_with_args(self, tool_name: str, tool_call_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Core async tool execution logic."""
+        result = await tool_registry.aexecute(tool_name, **arguments)
         return {
             "role": "tool",
-            "tool_call_id": self._get_tc_val(tool_call, "id"),
-            "name": function_name,
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
             "content": str(result)
         }
+
+    def _execute_tool(self, tool_call) -> str:
+        """Helper to execute a tool call synchronously."""
+        function_name = self._get_tc_val(tool_call, "function", "name")
+        raw_args = self._get_tc_val(tool_call, "function", "arguments") or "{}"
+        arguments = self._parse_arguments(raw_args)
+        return self._execute_tool_with_args(function_name, arguments)
+
+    def _execute_tool_with_args(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """Core sync tool execution logic."""
+        return tool_registry.execute(tool_name, **arguments)
+
+    def _parse_arguments(self, args: Any) -> Dict[str, Any]:
+        """Robustly parses tool arguments."""
+        if isinstance(args, dict):
+            return args
+        try:
+            return json.loads(args or "{}")
+        except json.JSONDecodeError:
+            adk_logger.warning(f"Failed to parse tool arguments: {args}")
+            return {}
 
     def _get_tc_val(self, tool_call, attr, subattr=None):
         """Helper to get value from either object or dict tool call."""
@@ -246,6 +394,77 @@ class LiteLLMAgent(BaseAgent):
         
         return tool_registry.execute(function_name, **arguments)
 
+    def _get_completion(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, **kwargs):
+        """Execute a completion call with automatic failover support."""
+        configs = [{"model": self.model, "api_key": self.api_key, "base_url": self.base_url}] + self.fallbacks
+        
+        last_err = None
+        for config in configs:
+            try:
+                model = config.get("model")
+                api_key = config.get("api_key", self.api_key)
+                base_url = config.get("base_url", self.base_url)
+                
+                return litellm.completion(
+                    model=model,
+                    messages=messages,
+                    api_key=api_key,
+                    base_url=base_url,
+                    tools=tools,
+                    **{**self.extra_kwargs, **kwargs}
+                )
+            except Exception as e:
+                # Only failover on specific recoverable errors
+                recoverable = (
+                    "rate_limit" in str(e).lower() or 
+                    "timeout" in str(e).lower() or 
+                    "service_unavailable" in str(e).lower() or
+                    "internal_server_error" in str(e).lower() or
+                    isinstance(e, (litellm.RateLimitError, litellm.ServiceUnavailableError, litellm.APIError, litellm.BadRequestError))
+                )
+                
+                if recoverable and config != configs[-1]:
+                    adk_logger.warning(f"Model {model} failed with recoverable error: {e}. Switching to fallback...")
+                    last_err = e
+                    continue
+                raise e
+        raise last_err
+
+    async def _aget_completion(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, **kwargs):
+        """Execute an async completion call with automatic failover support."""
+        configs = [{"model": self.model, "api_key": self.api_key, "base_url": self.base_url}] + self.fallbacks
+        
+        last_err = None
+        for config in configs:
+            try:
+                model = config.get("model")
+                api_key = config.get("api_key", self.api_key)
+                base_url = config.get("base_url", self.base_url)
+                
+                return await litellm.acompletion(
+                    model=model,
+                    messages=messages,
+                    api_key=api_key,
+                    base_url=base_url,
+                    tools=tools,
+                    **{**self.extra_kwargs, **kwargs}
+                )
+            except Exception as e:
+                recoverable = (
+                    "rate_limit" in str(e).lower() or 
+                    "timeout" in str(e).lower() or 
+                    "service_unavailable" in str(e).lower() or
+                    "internal_server_error" in str(e).lower() or
+                    isinstance(e, (litellm.RateLimitError, litellm.ServiceUnavailableError, litellm.APIError, litellm.BadRequestError))
+                )
+                
+                if recoverable and config != configs[-1]:
+                    adk_logger.warning(f"Model {model} failed with recoverable error: {e}. Switching to fallback...")
+                    last_err = e
+                    continue
+                raise e
+        raise last_err
+
     def invoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> str:
         """
         Execute a synchronous completion with automatic tool calling.
@@ -258,35 +477,83 @@ class LiteLLMAgent(BaseAgent):
         adk_logger.info(f"Invoking completion for model: {self.model}")
         
         while True:
-            response = litellm.completion(
-                model=self.model,
-                messages=messages,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                tools=tools,
-                **{**self.extra_kwargs, **kwargs}
-            )
-            
-            message = response.choices[0].message
-            
-            # Check if the model wants to call tools
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                tool_calls_to_process = [message.tool_calls[0]] if self._should_handle_sequentially() else message.tool_calls
-                
-                if self._should_handle_sequentially():
-                    message.tool_calls = tool_calls_to_process
+            # RESUME LOGIC
+            last_msg = messages[-1]
+            if not prompt and len(new_turns) == 0 and last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
+                adk_logger.info("Resuming from pending tool calls...")
+                message = last_msg
+                tool_calls_from_llm = last_msg.get("tool_calls", [])
+            else:
+                response = self._get_completion(messages=messages, tools=tools, **kwargs)
+                message = response.choices[0].message
+                tool_calls_from_llm = getattr(message, "tool_calls", [])
 
-                sanitized_msg = self._sanitize_message(message)
-                messages.append(sanitized_msg)
-                new_turns.append(sanitized_msg)
+            if tool_calls_from_llm:
+                pending_requests = []
+                for tc in tool_calls_from_llm:
+                    t_name = self._get_tc_val(tc, "function", "name")
+                    t_id = self._get_tc_val(tc, "id")
+                    t_args = self._parse_arguments(self._get_tc_val(tc, "function", "arguments"))
+                    
+                    # Check if this tool already has a decision in the ApprovalManager
+                    request = self.approval_manager.get_request(t_id)
+                    
+                    if not request:
+                        # NEW TOOL CALL: Check if it requires approval
+                        if self._should_require_approval(t_name, t_args):
+                            request = self.approval_manager.create_request(t_id, actual_session_id, t_name, t_args)
+                    
+                    if request and request.status == ApprovalStatus.PENDING:
+                        pending_requests.append(request)
+
+                if pending_requests:
+                    # Atomic Pause: if any tool in batch is pending, pause the whole turn
+                    if last_msg != self._sanitize_message(message):
+                        sanitized_msg = self._sanitize_message(message)
+                        self.memory.add_message(actual_session_id, sanitized_msg)
+                    
+                    return {
+                        "status": "requires_approval",
+                        "pending_approvals": [r.model_dump(mode='json') for r in pending_requests],
+                        "session_id": actual_session_id
+                    }
+
+                # If we get here, all tools are either safe or have a final decision (APPROVED/REJECTED/MODIFIED)
+                tool_calls_to_process = [tool_calls_from_llm[0]] if self._should_handle_sequentially() else tool_calls_from_llm
+
+                if self._should_handle_sequentially():
+                    if isinstance(message, dict):
+                        message["tool_calls"] = tool_calls_to_process
+                    else:
+                        message.tool_calls = tool_calls_to_process
+
+                if last_msg != self._sanitize_message(message):
+                    sanitized_msg = self._sanitize_message(message)
+                    messages.append(sanitized_msg)
+                    new_turns.append(sanitized_msg)
                 
                 for tool_call in tool_calls_to_process:
-                    result = self._execute_tool(tool_call)
+                    t_id = self._get_tc_val(tool_call, "id")
+                    request = self.approval_manager.get_request(t_id)
+                    if request and request.status == ApprovalStatus.REJECTED:
+                        result = f"Error: Tool call REJECTED by human reviewer. Reason: {request.reason or 'Not specified.'}"
+                    elif request and request.status == ApprovalStatus.MODIFIED:
+                        current_raw_args = self._get_tc_val(tool_call, "function", "arguments") or "{}"
+                        current_t_args = self._parse_arguments(current_raw_args)
+                        final_args = self.approval_manager.get_effective_args(t_id, default_args=current_t_args)
+                        raw_result = self._execute_tool_with_args(self._get_tc_val(tool_call, "function", "name"), final_args)
+                        # Prefix with context so LLM knows a human changed it
+                        result = f"[HUMAN OVERRIDE: Parameters were modified by a reviewer for safety/compliance] {raw_result}"
+                    else:
+                        current_raw_args = self._get_tc_val(tool_call, "function", "arguments") or "{}"
+                        current_t_args = self._parse_arguments(current_raw_args)
+                        final_args = self.approval_manager.get_effective_args(t_id, default_args=current_t_args)
+                        result = self._execute_tool_with_args(self._get_tc_val(tool_call, "function", "name"), final_args)
                     
                     tool_response = {
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.function.name,
+                        "tool_call_id": t_id,
+                        "name": self._get_tc_val(tool_call, "function", "name"),
                         "content": str(result)
                     }
                     messages.append(tool_response)
@@ -298,7 +565,6 @@ class LiteLLMAgent(BaseAgent):
             messages.append(final_msg)
             new_turns.append(final_msg)
             
-            # Persist only the new assistant/tool turns
             self._update_history(new_turns, actual_session_id=actual_session_id)
             return final_msg.get("content")
 
@@ -308,45 +574,130 @@ class LiteLLMAgent(BaseAgent):
         """
         actual_session_id = session_id.id if isinstance(session_id, Session) else (session_id or str(uuid.uuid4()))
         messages = self._prepare_messages(prompt, actual_session_id=actual_session_id)
+        
+        # Inject Vector Context (Async)
+        if prompt and self.vector_store:
+            context_str = await self._retrieve_context(prompt)
+            if context_str:
+                messages.insert(1, {"role": "system", "content": context_str})
+
         tools = tools or self.tools
         new_turns = []
         
         adk_logger.info(f"Invoking async completion for model: {self.model}")
         
         while True:
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=messages,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                tools=tools,
-                **{**self.extra_kwargs, **kwargs}
-            )
+            # RESUME LOGIC
+            last_msg = messages[-1]
+            if not prompt and len(new_turns) == 0 and last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
+                adk_logger.info("Resuming from pending tool calls (async)...")
+                message = last_msg
+                tool_calls_from_llm = last_msg.get("tool_calls", [])
+            else:
+                response = await self._aget_completion(messages=messages, tools=tools, **kwargs)
+                message = response.choices[0].message
+                tool_calls_from_llm = getattr(message, "tool_calls", [])
             
-            message = response.choices[0].message
-            
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                tool_calls_to_process = [message.tool_calls[0]] if self._should_handle_sequentially() else message.tool_calls
-                
-                if self._should_handle_sequentially():
-                    message.tool_calls = tool_calls_to_process
+            if tool_calls_from_llm:
+                pending_requests = []
+                for tc in tool_calls_from_llm:
+                    t_name = self._get_tc_val(tc, "function", "name")
+                    t_id = self._get_tc_val(tc, "id")
+                    t_args = self._parse_arguments(self._get_tc_val(tc, "function", "arguments"))
+                    
+                    request = self.approval_manager.get_request(t_id)
+                    if not request:
+                        if self._should_require_approval(t_name, t_args):
+                            request = self.approval_manager.create_request(t_id, actual_session_id, t_name, t_args)
+                    
+                    if request and request.status == ApprovalStatus.PENDING:
+                        pending_requests.append(request)
 
-                sanitized_msg = self._sanitize_message(message)
-                messages.append(sanitized_msg)
-                new_turns.append(sanitized_msg)
+                if pending_requests:
+                    if last_msg != self._sanitize_message(message):
+                        sanitized_msg = self._sanitize_message(message)
+                        self.memory.add_message(actual_session_id, sanitized_msg)
+                    return {
+                        "status": "requires_approval",
+                        "pending_approvals": [r.model_dump(mode='json') for r in pending_requests],
+                        "session_id": actual_session_id
+                    }
+
+                tool_calls_to_process = [tool_calls_from_llm[0]] if self._should_handle_sequentially() else tool_calls_from_llm
+
+                if self._should_handle_sequentially():
+                    if isinstance(message, dict):
+                        message["tool_calls"] = tool_calls_to_process
+                    else:
+                        message.tool_calls = tool_calls_to_process
+
+                if last_msg != self._sanitize_message(message):
+                    sanitized_msg = self._sanitize_message(message)
+                    messages.append(sanitized_msg)
+                    new_turns.append(sanitized_msg)
                 
                 if self._should_handle_sequentially():
                     for tool_call in tool_calls_to_process:
-                        result = await self._aexecute_tool(tool_call)
-                        messages.append(result)
-                        new_turns.append(result)
+                        t_id = self._get_tc_val(tool_call, "id")
+                        request = self.approval_manager.get_request(t_id)
+                        
+                        if request and request.status == ApprovalStatus.REJECTED:
+                            content = f"Error: Tool call REJECTED by human reviewer. Reason: {request.reason or 'Not specified.'}"
+                            res = {"role": "tool", "tool_call_id": t_id, "name": self._get_tc_val(tool_call, "function", "name"), "content": content}
+                        elif request and request.status == ApprovalStatus.MODIFIED:
+                            current_raw_args = self._get_tc_val(tool_call, "function", "arguments") or "{}"
+                            current_t_args = self._parse_arguments(current_raw_args)
+                            final_args = self.approval_manager.get_effective_args(t_id, default_args=current_t_args)
+                            raw_res = await self._aexecute_tool_with_args(self._get_tc_val(tool_call, "function", "name"), t_id, final_args)
+                            # Prefix with context
+                            raw_res["content"] = f"[HUMAN OVERRIDE: Parameters were modified by a reviewer for safety/compliance] {raw_res['content']}"
+                            res = raw_res
+                        else:
+                            current_raw_args = self._get_tc_val(tool_call, "function", "arguments") or "{}"
+                            current_t_args = self._parse_arguments(current_raw_args)
+                            final_args = self.approval_manager.get_effective_args(t_id, default_args=current_t_args)
+                            res = await self._aexecute_tool_with_args(self._get_tc_val(tool_call, "function", "name"), t_id, final_args)
+                        messages.append(res)
+                        new_turns.append(res)
                 else:
                     # Parallel Execution
                     import asyncio
-                    results = await asyncio.gather(*[self._aexecute_tool(tc) for tc in tool_calls_to_process])
-                    for res in results:
-                        messages.append(res)
-                        new_turns.append(res)
+                    results = []
+                    for tc in tool_calls_to_process:
+                        t_id = self._get_tc_val(tc, "id")
+                        request = self.approval_manager.get_request(t_id)
+                        
+                        if request and request.status == ApprovalStatus.REJECTED:
+                             results.append({"role": "tool", "tool_call_id": t_id, "name": self._get_tc_val(tc, "function", "name"), "content": f"Error: Tool call REJECTED by human reviewer."})
+                        elif request and request.status == ApprovalStatus.MODIFIED:
+                             current_raw_args = self._get_tc_val(tc, "function", "arguments") or "{}"
+                             current_t_args = self._parse_arguments(current_raw_args)
+                             final_args = self.approval_manager.get_effective_args(t_id, default_args=current_t_args)
+                             
+                             async def execute_and_prefix(t_name, t_call_id, args):
+                                 r = await self._aexecute_tool_with_args(t_name, t_call_id, args)
+                                 r["content"] = f"[HUMAN OVERRIDE: Parameters were modified by a reviewer] {r['content']}"
+                                 return r
+                                 
+                             results.append(execute_and_prefix(self._get_tc_val(tc, "function", "name"), t_id, final_args))
+                        else:
+                             current_raw_args = self._get_tc_val(tc, "function", "arguments") or "{}"
+                             current_t_args = self._parse_arguments(current_raw_args)
+                             final_args = self.approval_manager.get_effective_args(t_id, default_args=current_t_args)
+                             results.append(self._aexecute_tool_with_args(self._get_tc_val(tc, "function", "name"), t_id, final_args))
+                    
+                    # Gather coroutines
+                    actual_results = await asyncio.gather(*[r for r in results if not isinstance(r, dict)])
+                    
+                    idx = 0
+                    for i in range(len(results)):
+                        if isinstance(results[i], dict):
+                            messages.append(results[i])
+                            new_turns.append(results[i])
+                        else:
+                            messages.append(actual_results[idx])
+                            new_turns.append(actual_results[idx])
+                            idx += 1
                 continue
             
             final_msg = self._sanitize_message(message)
@@ -356,9 +707,10 @@ class LiteLLMAgent(BaseAgent):
             self._update_history(new_turns, actual_session_id=actual_session_id)
             return final_msg.get("content")
 
-    def stream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> Generator[str, None, None]:
+    def stream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, stream_events: bool = False, **kwargs) -> Generator[Union[str, Dict[str, Any]], None, None]:
         """
         Execute a streaming completion with automatic tool calling.
+        If stream_events=True, yields structured dictionaries instead of strings.
         """
         actual_session_id = session_id.id if isinstance(session_id, Session) else (session_id or str(uuid.uuid4()))
         messages = self._prepare_messages(prompt, actual_session_id=actual_session_id)
@@ -367,25 +719,18 @@ class LiteLLMAgent(BaseAgent):
         new_turns = []
         
         while True:
-            response = litellm.completion(
-                model=self.model,
-                messages=messages,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                stream=True,
-                tools=tools,
-                **{**self.extra_kwargs, **kwargs}
-            )
+            response = self._get_completion(messages=messages, tools=tools, stream=True, **kwargs)
             
             # Accumulate tool call parts
             full_content = ""
             tool_calls_by_index = {} # map of index -> list of SimpleNamespace
-            
+            notified_tools = set()
+
             for chunk in response:
                 delta = chunk.choices[0].delta
                 if delta.content:
                     full_content += delta.content
-                    yield delta.content
+                    yield {"type": "content", "delta": delta.content} if stream_events else delta.content
                 
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
                     for tc_delta in delta.tool_calls:
@@ -394,21 +739,16 @@ class LiteLLMAgent(BaseAgent):
                             tool_calls_by_index[idx] = []
                         
                         last_tc = tool_calls_by_index[idx][-1] if tool_calls_by_index[idx] else None
-                        
-                        # Decide if we need a new tool call object for this index
                         start_new = False
                         if last_tc is None:
                             start_new = True
                         else:
-                            # Start new if name is present and last one already has a name
                             if tc_delta.function and tc_delta.function.name and last_tc.function.name:
                                 start_new = True
-                            # Start new if ID is present and last one already has a different ID
                             elif tc_delta.id and last_tc.id and tc_delta.id != last_tc.id:
                                 start_new = True
                         
                         if start_new:
-                            from types import SimpleNamespace
                             new_tc = SimpleNamespace(
                                 id=tc_delta.id,
                                 function=SimpleNamespace(
@@ -418,7 +758,6 @@ class LiteLLMAgent(BaseAgent):
                             )
                             tool_calls_by_index[idx].append(new_tc)
                         else:
-                            # Update existing tool call
                             if tc_delta.id:
                                 last_tc.id = tc_delta.id
                             if tc_delta.function:
@@ -428,8 +767,15 @@ class LiteLLMAgent(BaseAgent):
                                     if last_tc.function.arguments is None:
                                         last_tc.function.arguments = ""
                                     last_tc.function.arguments += tc_delta.function.arguments
-  
-            # Build final flattened tool calls list (as dicts for history)
+                        
+                        # Yield "Thinking" event as soon as name is known
+                        current_tc = tool_calls_by_index[idx][-1]
+                        if current_tc.function.name and idx not in notified_tools:
+                            if stream_events:
+                                yield {"type": "tool_start", "name": current_tc.function.name, "index": idx}
+                            notified_tools.add(idx)
+
+            # Build final flat tool calls list
             tool_calls = []
             for idx in sorted(tool_calls_by_index.keys()):
                 for tc_obj in tool_calls_by_index[idx]:
@@ -444,64 +790,67 @@ class LiteLLMAgent(BaseAgent):
                         })
   
             if tool_calls:
-                # If sequential, only keep the first tool call
                 if self._should_handle_sequentially():
                     tool_calls = [tool_calls[0]]
   
-                # Add the assistant's composite tool call message to history
                 assistant_msg = self._sanitize_message({"role": "assistant", "tool_calls": tool_calls, "content": full_content})
                 messages.append(assistant_msg)
                 new_turns.append(assistant_msg)
                 
+                # Execute sequentially (sync stream is always sequential execution in practice for simplicity)
                 for tool_call in tool_calls:
+                    t_name = tool_call["function"]["name"]
                     result = self._execute_tool(tool_call)
+                    
+                    if stream_events:
+                         yield {"type": "tool_end", "name": t_name, "result": str(result)}
+                         
                     tool_resp = {
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
-                        "name": tool_call["function"]["name"],
+                        "name": t_name,
                         "content": str(result)
                     }
                     messages.append(tool_resp)
                     new_turns.append(tool_resp)
                 
-                # Loop back to continue the conversation with tool results
                 continue
             
-            # No tool calls, store final content and finish
             final_msg = self._sanitize_message({"role": "assistant", "content": full_content})
             messages.append(final_msg)
             new_turns.append(final_msg)
             self._update_history(new_turns, actual_session_id=actual_session_id)
             return
 
-    async def astream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> AsyncGenerator[str, None]:
+    async def astream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, stream_events: bool = False, **kwargs) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
         """
         Execute an asynchronous streaming completion with automatic tool calling.
+        If stream_events=True, yields structured dictionaries instead of strings.
         """
         actual_session_id = session_id.id if isinstance(session_id, Session) else (session_id or str(uuid.uuid4()))
         messages = self._prepare_messages(prompt, actual_session_id=actual_session_id)
+        
+        # Inject Vector Context (Async)
+        if prompt and self.vector_store:
+            context_str = await self._retrieve_context(prompt)
+            if context_str:
+                messages.insert(1, {"role": "system", "content": context_str})
+                
         tools = tools or self.tools
         new_turns = []
         
         while True:
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=messages,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                stream=True,
-                tools=tools,
-                **{**self.extra_kwargs, **kwargs}
-            )
+            response = await self._aget_completion(messages=messages, tools=tools, stream=True, **kwargs)
             
             full_content = ""
             tool_calls_by_index = {}
-            
+            notified_tools = set()
+
             async for chunk in response:
                 delta = chunk.choices[0].delta
                 if delta.content:
                     full_content += delta.content
-                    yield delta.content
+                    yield {"type": "content", "delta": delta.content} if stream_events else delta.content
                 
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
                     for tc_delta in delta.tool_calls:
@@ -520,7 +869,6 @@ class LiteLLMAgent(BaseAgent):
                                 start_new = True
                         
                         if start_new:
-                            from types import SimpleNamespace
                             new_tc = SimpleNamespace(
                                 id=tc_delta.id,
                                 function=SimpleNamespace(
@@ -539,7 +887,14 @@ class LiteLLMAgent(BaseAgent):
                                     if last_tc.function.arguments is None:
                                         last_tc.function.arguments = ""
                                     last_tc.function.arguments += tc_delta.function.arguments
-  
+                        
+                        # Yield "Thinking" event as soon as name is known
+                        current_tc = tool_calls_by_index[idx][-1]
+                        if current_tc.function.name and idx not in notified_tools:
+                            if stream_events:
+                                yield {"type": "tool_start", "name": current_tc.function.name, "index": idx}
+                            notified_tools.add(idx)
+
             tool_calls = []
             for idx in sorted(tool_calls_by_index.keys()):
                 for tc_obj in tool_calls_by_index[idx]:
@@ -563,15 +918,33 @@ class LiteLLMAgent(BaseAgent):
                 
                 if self._should_handle_sequentially():
                     for tool_call in tool_calls:
+                        t_name = tool_call["function"]["name"]
                         result = await self._aexecute_tool(tool_call)
+                        
+                        if stream_events:
+                             yield {"type": "tool_end", "name": t_name, "result": str(result["content"])}
+
                         messages.append(result)
                         new_turns.append(result)
                 else:
-                    import asyncio
-                    results = await asyncio.gather(*[self._aexecute_tool(tc) for tc in tool_calls])
-                    for res in results:
+                    # Parallel Execution - YIELD AS THEY FINISH
+                    pending = [self._aexecute_tool(tc) for tc in tool_calls]
+                    results_to_append = []
+                    
+                    for coro in asyncio.as_completed(pending):
+                        res = await coro
+                        t_name = res["name"]
+                        if stream_events:
+                            yield {"type": "tool_end", "name": t_name, "result": str(res["content"])}
+                        results_to_append.append(res)
+                    
+                    # Sort results back to original order for consistent history (optional but cleaner)
+                    # We can use tool_call_id or just append as they come
+                    for res in results_to_append:
                         messages.append(res)
                         new_turns.append(res)
+
+                # Continue turn after tool results
                 continue
             
             final_msg = self._sanitize_message({"role": "assistant", "content": full_content})
