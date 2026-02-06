@@ -15,7 +15,7 @@ from ..memory import BaseMemory, InMemoryMemory
 from ..memory.vector_store import VectorStore
 from .context import ContextManager
 from .approval import ApprovalManager
-from .models import ApprovalStatus, ApprovalRequest
+from .models import ApprovalStatus, ApprovalRequest, AgentResponse
 from .policy import PolicyEngine
 
 # Global LiteLLM configuration for resilience
@@ -34,26 +34,45 @@ class LiteLLMAgent(BaseAgent):
         warning often seen on Windows at script exit.
         """
         try:
-            await litellm.close_litellm_async_clients()
-            # Clear the internal cache to prevent litellm's own broken exit-cleanup from running
+            # 1. Aggressively close any cached clients we can find
             if hasattr(litellm, "in_memory_llm_clients_cache"):
                 cache = litellm.in_memory_llm_clients_cache
                 if hasattr(cache, "cache_dict"):
+                    for key, client in list(cache.cache_dict.items()):
+                        try:
+                            if hasattr(client, "aclose"):
+                                await client.aclose()
+                            elif hasattr(client, "close"):
+                                if asyncio.iscoroutinefunction(client.close):
+                                    await client.close()
+                                else:
+                                    client.close()
+                        except Exception:
+                            pass
+                    # Clear the cache so we don't try again or leave refs
                     cache.cache_dict.clear()
+
+            # 2. Call official cleanup
+            await litellm.close_litellm_async_clients()
             
-            # Structural Resolution: Patch litellm's cleanup to be a no-op 
+            # 3. Windows/aiohttp fix: Give time for underlying connections to close
+            await asyncio.sleep(0.250)
+
+            # 4. Structural Resolution: Patch litellm's cleanup to be a no-op 
             # This prevents its internal atexit handler from creating un-awaited coroutines
-            import litellm.llms.custom_httpx.async_client_cleanup as cleanup_mod
-            import asyncio
-            
-            # We return a completed future so that run_until_complete(close_...) still works
-            # but doesn't actually start any new async work or leave coroutines hanging.
-            def sync_noop(*args, **kwargs):
-                f = asyncio.Future()
-                f.set_result(None)
-                return f
-            
-            cleanup_mod.close_litellm_async_clients = sync_noop
+            try:
+                import litellm.llms.custom_httpx.async_client_cleanup as cleanup_mod
+                
+                # We return a completed future so that run_until_complete(close_...) still works
+                # but doesn't actually start any new async work or leave coroutines hanging.
+                def sync_noop(*args, **kwargs):
+                    f = asyncio.Future()
+                    f.set_result(None)
+                    return f
+                
+                cleanup_mod.close_litellm_async_clients = sync_noop
+            except ImportError:
+                pass
             
             adk_logger.debug("Global LiteLLM async clients closed and cache cleared.")
         except Exception as e:
@@ -101,15 +120,31 @@ class LiteLLMAgent(BaseAgent):
                 if callable(t):
                     # It's a function, register it (if not already) and get definition
                     processed_tools.append(tool_registry._register_function(t))
-                else:
-                    # It's already a definition dict
-                    processed_tools.append(t)
+                elif isinstance(t, dict):
+                     processed_tools.append(t)
             self.tools = processed_tools
-
-        # Core config extraction
-        self.approval_manager = kwargs.pop("approval_manager", None) or ApprovalManager()
-        self.policy_engine = kwargs.pop("policy_engine", None) or PolicyEngine()
-        self.sequential_tool_execution = kwargs.pop("sequential_tool_execution", settings.sequential_execution)
+            
+        self.memory = memory or InMemoryMemory()
+        self.max_context_tokens = max_context_tokens
+        
+        # Auto-initialize Vector Search if not provided but requested? 
+        # For now, we respect explicit configuration.
+        self.vector_store = vector_store
+        
+        self.approval_manager = ApprovalManager()
+        self.policy_engine = PolicyEngine()
+        
+        # Setup Fallbacks
+        self.fallbacks = fallbacks or []
+        
+        adk_logger.info(f"Agent initialized with model: {self.model}")
+        
+        # Determine tool execution mode (defaulting to Parallel if not specified)
+        parallel_tools = kwargs.pop("parallel_tool_calls", None)
+        if parallel_tools is not None:
+             self.sequential_tool_execution = not parallel_tools
+        else:
+             self.sequential_tool_execution = kwargs.pop("sequential_tool_execution", settings.sequential_execution)
 
         self.extra_kwargs = kwargs
         
@@ -166,6 +201,12 @@ class LiteLLMAgent(BaseAgent):
             results = await self.vector_store.search(prompt, k=3)
             if not results:
                 return None
+            
+            adk_logger.info(f"Retrieved {len(results)} chunks for context:")
+            for i, r in enumerate(results):
+                content = r.get('text', '')
+                preview = content[:200] + "..." if len(content) > 200 else content
+                adk_logger.info(f"Chunk {i+1}: {preview}")
             
             context_block = "\n".join([f"- {r['text']}" for r in results])
             return f"Relevant Context from Memory:\n{context_block}"
@@ -465,7 +506,7 @@ class LiteLLMAgent(BaseAgent):
                 raise e
         raise last_err
 
-    def invoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> str:
+    def invoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> Union['AgentResponse', Dict[str, Any]]:
         """
         Execute a synchronous completion with automatic tool calling.
         """
@@ -473,6 +514,8 @@ class LiteLLMAgent(BaseAgent):
         messages = self._prepare_messages(prompt, actual_session_id=actual_session_id)
         tools = tools or self.tools
         new_turns = [] # Track only what's new in this specific call
+        accumulated_content = []
+        executed_tool_calls = []
         
         adk_logger.info(f"Invoking completion for model: {self.model}")
         
@@ -531,8 +574,12 @@ class LiteLLMAgent(BaseAgent):
                     sanitized_msg = self._sanitize_message(message)
                     messages.append(sanitized_msg)
                     new_turns.append(sanitized_msg)
+                    if sanitized_msg.get("content"):
+                         accumulated_content.append(sanitized_msg["content"].strip())
                 
                 for tool_call in tool_calls_to_process:
+                    executed_tool_calls.append(self._sanitize_tool_call(tool_call))
+                    
                     t_id = self._get_tc_val(tool_call, "id")
                     request = self.approval_manager.get_request(t_id)
                     if request and request.status == ApprovalStatus.REJECTED:
@@ -564,11 +611,19 @@ class LiteLLMAgent(BaseAgent):
             final_msg = self._sanitize_message(message)
             messages.append(final_msg)
             new_turns.append(final_msg)
+            if final_msg.get("content"):
+                 accumulated_content.append(final_msg["content"].strip())
             
             self._update_history(new_turns, actual_session_id=actual_session_id)
-            return final_msg.get("content")
+            
+            return AgentResponse(
+                content=final_msg.get("content") or "",
+                accumulated_content="\n".join(accumulated_content),
+                tool_calls=executed_tool_calls,
+                session_id=actual_session_id
+            )
 
-    async def ainvoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> str:
+    async def ainvoke(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, **kwargs) -> Union['AgentResponse', Dict[str, Any]]:
         """
         Execute an asynchronous completion with automatic tool calling.
         """
@@ -583,6 +638,8 @@ class LiteLLMAgent(BaseAgent):
 
         tools = tools or self.tools
         new_turns = []
+        accumulated_content = []
+        executed_tool_calls = []
         
         adk_logger.info(f"Invoking async completion for model: {self.model}")
         
@@ -635,9 +692,12 @@ class LiteLLMAgent(BaseAgent):
                     sanitized_msg = self._sanitize_message(message)
                     messages.append(sanitized_msg)
                     new_turns.append(sanitized_msg)
+                    if sanitized_msg.get("content"):
+                         accumulated_content.append(sanitized_msg["content"].strip())
                 
                 if self._should_handle_sequentially():
                     for tool_call in tool_calls_to_process:
+                        executed_tool_calls.append(self._sanitize_tool_call(tool_call))
                         t_id = self._get_tc_val(tool_call, "id")
                         request = self.approval_manager.get_request(t_id)
                         
@@ -664,6 +724,7 @@ class LiteLLMAgent(BaseAgent):
                     import asyncio
                     results = []
                     for tc in tool_calls_to_process:
+                        executed_tool_calls.append(self._sanitize_tool_call(tc))
                         t_id = self._get_tc_val(tc, "id")
                         request = self.approval_manager.get_request(t_id)
                         
@@ -703,10 +764,17 @@ class LiteLLMAgent(BaseAgent):
             final_msg = self._sanitize_message(message)
             messages.append(final_msg)
             new_turns.append(final_msg)
+            if final_msg.get("content"):
+                 accumulated_content.append(final_msg["content"].strip())
             
             self._update_history(new_turns, actual_session_id=actual_session_id)
-            return final_msg.get("content")
-
+            
+            return AgentResponse(
+                content=final_msg.get("content") or "",
+                accumulated_content="\n".join(accumulated_content),
+                tool_calls=executed_tool_calls,
+                session_id=actual_session_id
+            )
     def stream(self, prompt: str, tools: Optional[List[Dict[str, Any]]] = None, session_id: Optional[Union[str, Session]] = None, stream_events: bool = False, **kwargs) -> Generator[Union[str, Dict[str, Any]], None, None]:
         """
         Execute a streaming completion with automatic tool calling.

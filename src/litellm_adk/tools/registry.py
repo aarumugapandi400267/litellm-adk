@@ -117,7 +117,11 @@ class ToolRegistry:
         if inspect.iscoroutinefunction(func):
             return await func(**kwargs)
         else:
-            return func(**kwargs)
+            # OPTIMIZATION: Offload synchronous blocking tools to a thread
+            # so they don't block the async event loop during parallel execution.
+            import asyncio
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, lambda: func(**kwargs))
 
 # Global tool registry
 tool_registry = ToolRegistry()

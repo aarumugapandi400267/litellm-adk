@@ -2,7 +2,7 @@ import litellm
 import uuid
 import logging
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable, Awaitable
 
 from ..vector_store import VectorStore
 from ...observability.logger import adk_logger
@@ -19,8 +19,9 @@ class PostgresVectorStore(VectorStore):
     def __init__(self, 
                  connection_string: str, 
                  table_name: str = "adk_vectors",
-                 embedding_model: str = "text-embedding-3-small",
-                 vector_dim: int = 1536):
+                 embedding_model: Optional[str] = None,
+                 vector_dim: int = 384,
+                 embedding_function: Optional[Callable[[List[str]], Awaitable[List[List[float]]]]] = None):
         try:
             import asyncpg
             from pgvector.asyncpg import register_vector
@@ -29,8 +30,33 @@ class PostgresVectorStore(VectorStore):
         
         self.connection_string = connection_string
         self.table_name = table_name
-        self.embedding_model = embedding_model
         self.vector_dim = vector_dim
+        
+        # Default to local sentence-transformers if nothing specified
+        if not embedding_model and not embedding_function:
+            try:
+                from sentence_transformers import SentenceTransformer
+                import asyncio
+                
+                # Lazy load for performance
+                self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+                self.vector_dim = 384 # Force dim for this default
+                
+                async def default_local_emb(texts):
+                    loop = asyncio.get_running_loop()
+                    embeddings = await loop.run_in_executor(None, self._st_model.encode, texts)
+                    return embeddings.tolist()
+                    
+                self.embedding_function = default_local_emb
+                self.embedding_model = "local-st"
+            except ImportError:
+                 adk_logger.warning("sentence-transformers not found. Please providing embedding_model or install sentence-transformers.")
+                 self.embedding_function = None
+                 self.embedding_model = embedding_model or "text-embedding-3-small"
+        else:
+            self.embedding_function = embedding_function
+            self.embedding_model = embedding_model or "text-embedding-3-small"
+            
         self.pool = None
 
     async def _ensure_pool(self):
@@ -52,7 +78,10 @@ class PostgresVectorStore(VectorStore):
                 """)
 
     async def _get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings using LiteLLM."""
+        """Generate embeddings using custom function or LiteLLM."""
+        if self.embedding_function:
+            return await self.embedding_function(texts)
+            
         response = await litellm.aembedding(
             model=self.embedding_model,
             input=texts

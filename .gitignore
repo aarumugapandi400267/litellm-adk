@@ -22,6 +22,7 @@ build_log.txt
 
 # IDEs
 .vscode/
+trash
 .idea/
 Publish.md
 plan
