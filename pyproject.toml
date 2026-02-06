@@ -4,18 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "litellm-adk"
-version = "0.2.1"
+version = "0.2.2"
 description = "Production-grade multiservice Agent Development Kit"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 dependencies = [
-    "litellm>=1.20.0",
+    "litellm>=1.40.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "loguru>=0.7.0",
     "python-dotenv>=1.0.0",
-    "pymongo>=4.0.0"
+    "pymongo>=4.0.0",
+    "asyncpg>=0.29.0",
+    "pgvector>=0.2.0",
+    "orjson>=3.10.0"
 ]
 
 classifiers = [
@@ -29,6 +32,14 @@ dev = [
     "black",
     "isort",
     "mypy"
+]
+embeddings = [
+    "sentence-transformers>=2.0.0"
+]
+telemetry = [
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp"
 ]
 
 [tool.setuptools.packages.find]
