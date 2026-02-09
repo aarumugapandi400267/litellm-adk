@@ -3,6 +3,7 @@ import litellm
 import json
 import logging
 import asyncio
+from collections import OrderedDict
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, Union, Callable, Generator, AsyncGenerator
 
@@ -26,15 +27,36 @@ class LiteLLMAgent(BaseAgent):
     Multiservice agent supporting dynamic overrides for base_url and api_key.
     """
 
-    @classmethod
-    async def aclose(cls):
+    async def aclose(self):
         """
-        Properly close all global litellm async clients and clear caches.
+        Properly close all global litellm async clients and agent resources.
         This provides a structural resolution to the 'coroutine never awaited' 
         warning often seen on Windows at script exit.
         """
+        # 1. Close instance resources
+        if getattr(self, "vector_store", None) and hasattr(self.vector_store, "close"):
+            try:
+                # Check if it's async or sync close
+                if asyncio.iscoroutinefunction(self.vector_store.close):
+                    await self.vector_store.close()
+                else:
+                    self.vector_store.close()
+                adk_logger.debug("Closed vector_store connection.")
+            except Exception as e:
+                adk_logger.warning(f"Error closing vector_store: {e}")
+
+        # 2. Close memory resources if applicable
+        if getattr(self, "memory", None) and hasattr(self.memory, "close"):
+             try:
+                if asyncio.iscoroutinefunction(self.memory.close):
+                    await self.memory.close()
+                else:
+                    self.memory.close()
+             except Exception:
+                 pass
+
         try:
-            # 1. Aggressively close any cached clients we can find
+            # 3. Global LiteLLM Cleanup (Aggressively close any cached clients)
             if hasattr(litellm, "in_memory_llm_clients_cache"):
                 cache = litellm.in_memory_llm_clients_cache
                 if hasattr(cache, "cache_dict"):
@@ -51,11 +73,11 @@ class LiteLLMAgent(BaseAgent):
                             pass
                     # Clear the cache so we don't try again or leave refs
                     cache.cache_dict.clear()
-
-            # 2. Call official cleanup
+            
+            # 4. Call official cleanup
             await litellm.close_litellm_async_clients()
             
-            # 3. Windows/aiohttp fix: Give time for underlying connections to close
+            # 5. Windows/aiohttp fix: Give time for underlying connections to close
             await asyncio.sleep(0.250)
 
             # 4. Structural Resolution: Patch litellm's cleanup to be a no-op 
@@ -100,7 +122,6 @@ class LiteLLMAgent(BaseAgent):
         self.model = model or settings.model
         self.api_key = api_key or settings.api_key
         self.base_url = base_url or settings.base_url
-        self.vector_store = vector_store
         
         # Automatically prepend 'openai/' if a base_url is used to force proxy/OpenAI-compatible routing
         if self.base_url and not self.model.startswith("openai/"):
@@ -123,14 +144,17 @@ class LiteLLMAgent(BaseAgent):
                 elif isinstance(t, dict):
                      processed_tools.append(t)
             self.tools = processed_tools
-            
-        self.memory = memory or InMemoryMemory()
+        
+        # Initialize BaseAgent (Model, Memory, VectorStore)
+        resolved_memory = memory or InMemoryMemory()
+        super().__init__(
+            model=self.model,
+            system_prompt=system_prompt,
+            memory=resolved_memory,
+            vector_store=vector_store
+        )
+        
         self.max_context_tokens = max_context_tokens
-        
-        # Auto-initialize Vector Search if not provided but requested? 
-        # For now, we respect explicit configuration.
-        self.vector_store = vector_store
-        
         self.approval_manager = ApprovalManager()
         self.policy_engine = PolicyEngine()
         
@@ -138,6 +162,12 @@ class LiteLLMAgent(BaseAgent):
         self.fallbacks = fallbacks or []
         
         adk_logger.info(f"Agent initialized with model: {self.model}")
+        
+        # LRU Cache for Vector Retrieval
+        self._context_cache: OrderedDict[str, str] = OrderedDict()
+        self._max_cache_size = kwargs.pop("vector_cache_size", 50)
+        self.vector_search_threshold = kwargs.pop("vector_search_threshold", None)
+        self._max_cache_size = kwargs.pop("vector_cache_size", 50)
         
         # Determine tool execution mode (defaulting to Parallel if not specified)
         parallel_tools = kwargs.pop("parallel_tool_calls", None)
@@ -193,12 +223,18 @@ class LiteLLMAgent(BaseAgent):
         self.approval_manager.submit_decision(request_id, ApprovalStatus.MODIFIED, reviewer, reason, modified_args)
 
     async def _retrieve_context(self, prompt: str) -> Optional[str]:
-        """Async semantic search for relevant context."""
+        """Async semantic search for relevant context with LRU Caching."""
         if not self.vector_store or not prompt:
             return None
         
+        # 1. Check Cache
+        if prompt in self._context_cache:
+            adk_logger.debug(f"Cache hit for vector context: {prompt[:30]}...")
+            self._context_cache.move_to_end(prompt)
+            return self._context_cache[prompt]
+            
         try:
-            results = await self.vector_store.search(prompt, k=3)
+            results = await self.vector_store.search(prompt, k=3, score_threshold=self.vector_search_threshold)
             if not results:
                 return None
             
@@ -209,10 +245,19 @@ class LiteLLMAgent(BaseAgent):
                 adk_logger.info(f"Chunk {i+1}: {preview}")
             
             context_block = "\n".join([f"- {r['text']}" for r in results])
-            return f"Relevant Context from Memory:\n{context_block}"
+            result_str = f"Relevant Context from Memory:\n{context_block}"
+            
+            # 2. Update Cache
+            self._context_cache[prompt] = result_str
+            self._context_cache.move_to_end(prompt)
+            if len(self._context_cache) > self._max_cache_size:
+                self._context_cache.popitem(last=False)
+                
+            return result_str
         except Exception as e:
             adk_logger.warning(f"Vector retrieval failed: {e}")
             return None
+
 
     def _prepare_messages(self, prompt: str, actual_session_id: str) -> List[Dict[str, str]]:
         # 2. Fetch/Initialize History from Memory

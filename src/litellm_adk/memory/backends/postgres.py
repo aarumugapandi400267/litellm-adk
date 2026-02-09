@@ -121,7 +121,7 @@ class PostgresVectorStore(VectorStore):
             
         return ids
 
-    async def search(self, query: str, k: int = 4) -> List[Dict[str, Any]]:
+    async def search(self, query: str, k: int = 4, score_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
         await self._ensure_pool()
         import json
         
@@ -138,11 +138,15 @@ class PostgresVectorStore(VectorStore):
             
         results = []
         for row in rows:
+            score = float(row["score"])
+            if score_threshold is not None and score < score_threshold:
+                continue
+            
             results.append({
                 "id": str(row["id"]),
                 "text": row["text"],
                 "metadata": json.loads(row["metadata"]),
-                "score": float(row["score"])
+                "score": score
             })
             
         return results

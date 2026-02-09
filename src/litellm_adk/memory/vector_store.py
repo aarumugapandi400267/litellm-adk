@@ -12,7 +12,7 @@ class VectorStore(ABC):
         pass
 
     @abstractmethod
-    async def search(self, query: str, k: int = 4) -> List[Dict[str, Any]]:
+    async def search(self, query: str, k: int = 4, score_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
         """
         Search for similar texts.
         Returns a list of dicts with 'text', 'metadata', and 'score'.
