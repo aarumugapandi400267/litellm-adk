@@ -16,8 +16,6 @@ async def calculate_shipping(zip_code: str):
     await asyncio.sleep(1.5) # Non-blocking delay
     return f"Shipping to {zip_code}: $12.99."
 
-import os
-
 async def main():
     # Detect if we should use a real model or fallback for demo purposes if not configured
     model = "gemini/gemini-2.5-flash"
