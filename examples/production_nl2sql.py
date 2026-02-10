@@ -3,9 +3,8 @@ import asyncio
 import logging
 import sys
 from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, ForeignKey
-from litellm_adk.agents import NL2SQLAgent  
-from litellm_adk.memory import FileMemory
-from litellm_adk.agents import DatabaseAgent
+from litellm_adk.integrations.database.agent import DatabaseAgent, NL2SQLAgent
+from litellm_adk.integrations.memory.local.file import FileMemory
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
@@ -19,13 +18,7 @@ async def main():
     # 2. Initialize Agent with Config (Demonstrates Adapter Usage)
     db_config = {
         "type": "mongo",
-        # "url": "mongodb://localhost:27017/oci_playground"
-        # Demonstrate granular config support:
-        "host": "localhost",
-        "port": 27017,
-        "database": "oci_playground",
-        "username": "", # Optional
-        "password": ""  # Optional
+        "url": "mongodb://localhost:27017/oci_playground"
     }
     
     agent = DatabaseAgent(
@@ -54,7 +47,7 @@ async def main():
     try:
         # 3. Test Cases
         print("\n--- Test 1: Simple Aggregation ---")
-        prompt1 = "List all sessions created after 2026-01-28T17:03:23.589981"
+        prompt1 = "List all sessions?" 
         print(f"User: {prompt1}")
         # Note: In a real run without keys, this will fail or fallback.
         try:
@@ -75,7 +68,13 @@ async def main():
                     print(chunk, end="", flush=True)
                     full_response += chunk
             print() # Newline after stream
-            # print(agent.last_query_result) # Commented out to reduce noise
+            if agent.last_query_result:
+                print("\n--- 📋 Result Data (UI View) ---")
+                # Format as a simple list of records for the demo
+                for idx, row in enumerate(agent.last_query_result[:5]): # Show first 5
+                     print(f"Record {idx+1}: {row}")
+                if len(agent.last_query_result) > 5:
+                    print(f"... and {len(agent.last_query_result) - 5} more records.")
         except Exception as e:
             print(f"Agent failed (likely no API key): {e}")
             import traceback

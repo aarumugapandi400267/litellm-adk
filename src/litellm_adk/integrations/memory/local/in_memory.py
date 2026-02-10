@@ -1,5 +1,5 @@
 from typing import List, Dict, Any
-from .base import BaseMemory
+from ....core.memory import BaseMemory
 
 class InMemoryMemory(BaseMemory):
     """

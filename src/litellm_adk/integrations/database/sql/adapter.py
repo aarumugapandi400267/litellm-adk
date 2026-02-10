@@ -1,9 +1,9 @@
 from typing import List, Dict, Any, Union, Optional
 import logging
-from .base import DatabaseAdapter
-from ..tools.sql_tools import SQLTools
+from ....core.adapter import DatabaseAdapter
+from .tools import SQLTools
 
-logger = logging.getLogger("litellm_adk.adapters.sql")
+logger = logging.getLogger("litellm_adk.integrations.database.sql")
 
 class SQLAdapter(DatabaseAdapter):
     """
@@ -45,41 +45,34 @@ class SQLAdapter(DatabaseAdapter):
         def execute_sql(query: str):
             """Execute a SQL query. Returns results as JSON."""
             result_str = self.tools.execute_sql_tool(query)
-            
-            # If callback registered, try to capture the data.
-            # But wait, execute_sql_tool returns a STRING.
-            # Ideally, the TOOL should return (data, string).
-            # For now, let's just callback with the string (JSON) or try to decode it.
             if hasattr(self, 'result_callback') and self.result_callback:
                  import json
                  try:
-                     # Remove the "Query executed successfully..." prefix if present
                      json_part = result_str
                      if "\n" in result_str:
                          parts = result_str.split("\n", 1)
                          if parts[0].startswith("Query executed"):
                              json_part = parts[1]
-                             # Remove truncation suffix if present
                              if "... (Result truncated" in json_part:
                                  json_part = json_part.split("\n... (Result truncated")[0]
-                     
                      data = json.loads(json_part)
                      self.result_callback(data)
-                     
-                     # Blind Mode: Return summary only
                      count = len(data) if isinstance(data, list) else 1
                      return f"Query executed successfully. Found {count} rows. Data hidden from LLM and sent to UI."
-                 except:
-                     pass # Failed to parse JSON or just an error message string
-            
+                 except: pass
             return result_str
-        
-        return [execute_sql]
+
+        def inspect_table(table_name: str):
+            """Get the detailed schema (columns, types, foreign keys) for a specific table."""
+            return self.tools.get_schema_summary([table_name])
+
+        return [execute_sql, inspect_table]
 
     def get_system_prompt_template(self) -> str:
         return """
 1. Generate a valid SQL query to answer the user's question.
-2. Select relevant tables from the schema.
-3. Use the 'execute_sql' tool (which you can call) to run the query.
-4. Only use SELECT statements. Data modification is strictly prohibited.
+2. If you are unsure of the schema for a table, use 'inspect_table'.
+3. Select relevant tables from the schema.
+4. Use the 'execute_sql' tool (which you can call) to run the query.
+5. Only use SELECT statements. Data modification is strictly prohibited.
 """

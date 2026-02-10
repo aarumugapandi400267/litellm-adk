@@ -4,8 +4,8 @@ import logging
 import asyncio
 from typing import List, Dict, Any, Optional, Callable, Awaitable
 
-from ..vector_store import VectorStore
-from ...observability.logger import adk_logger
+from .....core.vector_store import VectorStore
+from .....observability.logger import adk_logger
 
 class PostgresVectorStore(VectorStore):
     """

@@ -1,9 +1,12 @@
 from typing import List, Dict, Any, Optional, Union
 import logging
-from ..core.agent import LiteLLMAgent
-from ..adapters import DatabaseAdapter, SQLAdapter, MongoAdapter
+from ...core.agent import LiteLLMAgent
+from ...core.adapter import DatabaseAdapter
+from .sql.adapter import SQLAdapter
+from .mongo.adapter import MongoAdapter
+from .mysql.adapter import MySQLAdapter
 
-logger = logging.getLogger("litellm_adk.agents.database")
+logger = logging.getLogger("litellm_adk.integrations.database")
 
 class DatabaseAgent(LiteLLMAgent):
     """
@@ -38,6 +41,8 @@ class DatabaseAgent(LiteLLMAgent):
             # Legacy/Simple mode inference
             if db_url.startswith("mongodb"):
                 self.adapter = MongoAdapter({"url": db_url})
+            elif db_url.startswith("mysql"):
+                self.adapter = MySQLAdapter({"url": db_url})
             else:
                  self.adapter = SQLAdapter({"url": db_url, "schema_config": schema_config})
         elif db_config:
@@ -45,6 +50,8 @@ class DatabaseAgent(LiteLLMAgent):
             db_type = db_config.get("type", "sql").lower()
             if db_type == "mongo":
                 self.adapter = MongoAdapter(db_config)
+            elif db_type == "mysql":
+                self.adapter = MySQLAdapter(db_config)
             else:
                 if schema_config:
                     db_config["schema_config"] = schema_config
@@ -115,9 +122,10 @@ class DatabaseAgent(LiteLLMAgent):
 The user cannot see the private data execution results, but you represent as if you know the data.
 1. **FIRST**, you MUST call the tool (e.g., 'execute_sql' or 'mongo_find'). Do NOT generate the summary yet.
 2. The tool will return a hidden summary (e.g. '500 rows found').
-3. **AFTER** the tool returns, you must respond to the user confirming the action, e.g., "I have retrieved 500 orders from the database..."
-4. Do NOT say "I cannot see the data". Pretend you are presenting it.
-5. Do NOT hallucinate the result before calling the tool.
+3. **AFTER** the tool returns, you must respond to the user confirming the action, e.g., "I have retrieved 500 orders..."
+4. If the tool result is empty or doesn't seem to contain the answer, do NOT hallucinate facts. You can say "No matching records found" or try to 'inspect_table' another table.
+5. Do NOT say "I cannot see the data". Pretend you are presenting the summary provided by the tool.
+6. Do NOT hallucinate the result before calling the tool.
 """
         else:
              instructions += "\n5. If the result is empty, try a broader query.\n6. Return the final answer in natural language."

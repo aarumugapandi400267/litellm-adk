@@ -1,7 +1,7 @@
 import asyncio
 import os
 from litellm_adk import LiteLLMAgent, tool
-from litellm_adk.memory.backends.postgres import PostgresVectorStore
+from litellm_adk.integrations.memory.vector.backends.postgres import PostgresVectorStore
 
 # 1. Define tools
 @tool

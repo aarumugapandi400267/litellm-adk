@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Optional
-from .base import BaseMemory
+from ....core.memory import BaseMemory
 import pymongo
 
 class MongoDBMemory(BaseMemory):

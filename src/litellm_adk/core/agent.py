@@ -7,13 +7,14 @@ from collections import OrderedDict
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, Union, Callable, Generator, AsyncGenerator
 
-from .base import BaseAgent
+from .base_agent import BaseAgent
 from ..observability.logger import adk_logger
 from ..config.settings import settings
 from ..session import Session
-from ..tools.registry import tool_registry
-from ..memory import BaseMemory, InMemoryMemory
-from ..memory.vector_store import VectorStore
+from .tool_registry import tool_registry
+from .memory import BaseMemory
+from .vector_store import VectorStore
+from ..integrations.memory.local.in_memory import InMemoryMemory
 from .context import ContextManager
 from .approval import ApprovalManager
 from .models import ApprovalStatus, ApprovalRequest, AgentResponse

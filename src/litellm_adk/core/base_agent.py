@@ -2,8 +2,8 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Union, Generator, AsyncGenerator
 
-from ..memory import BaseMemory
-from ..memory.vector_store import VectorStore
+from .memory import BaseMemory
+from .vector_store import VectorStore
 
 class BaseAgent(ABC):
     """

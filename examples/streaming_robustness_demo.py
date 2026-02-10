@@ -1,7 +1,6 @@
 import asyncio
 import time
-from litellm_adk import LiteLLMAgent
-from litellm_adk.tools import tool
+from litellm_adk import LiteLLMAgent, tool
 
 # 1. Define slow parallel tools to simulate real-world latency
 @tool

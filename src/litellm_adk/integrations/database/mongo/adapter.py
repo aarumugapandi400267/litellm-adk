@@ -1,9 +1,9 @@
 from typing import List, Dict, Any, Union, Optional
 import logging
-from .base import DatabaseAdapter
-from ..tools.mongo_tools import MongoTools
+from ....core.adapter import DatabaseAdapter
+from .tools import MongoTools
 
-logger = logging.getLogger("litellm_adk.adapters.mongo")
+logger = logging.getLogger("litellm_adk.integrations.database.mongo")
 
 class MongoAdapter(DatabaseAdapter):
     """
@@ -71,7 +71,11 @@ class MongoAdapter(DatabaseAdapter):
 
             return res_str
             
-        return [mongo_find, mongo_aggregate]
+        def inspect_collection(collection_name: str):
+            """Get a sample document and structure from a specific collection."""
+            return self.tools.get_schema_summary([collection_name])
+
+        return [mongo_find, mongo_aggregate, inspect_collection]
 
     def _try_callback(self, res_str: str) -> bool:
         if hasattr(self, 'result_callback') and self.result_callback:
@@ -97,7 +101,8 @@ class MongoAdapter(DatabaseAdapter):
         return """
 1. Analyze the user's request and the Available Tables/Schema.
 2. Select relevant collections/tables.
-3. Use 'mongo_find' for simple queries or 'mongo_aggregate' for complex analysis.
-4. Queries must be valid JSON objects/pipelines.
-5. Security: 'mongo_aggregate' cannot use $out or $merge.
+3. If you are unsure of the schema for a collection, use 'inspect_collection'.
+4. Use 'mongo_find' for simple queries or 'mongo_aggregate' for complex analysis.
+5. Queries must be valid JSON objects/pipelines.
+6. Security: 'mongo_aggregate' cannot use $out or $merge.
 """

@@ -4,8 +4,8 @@ import logging
 import asyncio
 from typing import List, Dict, Any, Optional
 
-from ..vector_store import VectorStore
-from ...observability.logger import adk_logger
+from .....core.vector_store import VectorStore
+from .....observability.logger import adk_logger
 
 class MongoVectorStore(VectorStore):
     """

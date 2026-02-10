@@ -1,75 +1,95 @@
-# LiteLLM ADK (Agent Development Kit)
+# 🤖 LiteLLM ADK (Agent Development Kit)
 
-Highly flexible multiservice Agent Development Kit for building AI agents using LiteLLM.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Powered by LiteLLM](https://img.shields.io/badge/Powered%20by-LiteLLM-blue)](https://github.com/BerriAI/litellm)
 
-Built for developers who need to swap models, API keys, and base URLs dynamically while maintaining a robust structure for tool usage, **modular memory persistence**, and observability.
+A production-grade, highly flexible multiservice framework for building AI agents. Swap models, API keys, and configurations dynamically while maintaining a robust structure for tool usage, complex memory persistence, and human oversight.
 
-## Features
+---
 
-- **Model Agnostic**: Access 100+ LLMs (OpenAI, Anthropic, OCI Grok-3, Llama, etc.) seamlessly.
-- **Easy Tools**: Register Python functions with the `@tool` decorator. No manual JSON schema management.
-- **Modular Memory**: Native support for conversation persistence:
-    - `InMemoryMemory`: Fast, ephemeral storage.
-    - `FileMemory`: Simple JSON-based local persistence.
-    - `MongoDBMemory`: Scalable, remote persistence.
-- **Parallel & Sequential Execution**: Built-in support for parallel tool calls with robust stream accumulation.
-- **Dynamic Configuration**: Global defaults via `.env` or per-agent/per-request overrides.
-- **Async & Streaming**: Native support for `ainvoke`, `stream`, and `astream`.
+## 🌟 Key Features
 
-## Installation
+*   **🔌 Model Agnostic**: Native support for 100+ LLMs (OpenAI, Anthropic, OCI Grok-3, Llama) via LiteLLM.
+*   **📊 Database Intelligence**: Built-in `DatabaseAgent` (NL2SQL) with adapters for MySQL, PostgreSQL, and MongoDB.
+*   **🧠 Advanced Memory**: Pluggable persistence via local JSON, MongoDB, or Vector stores (Chroma, PGVector).
+*   **🛡️ Human-in-the-Loop**: Integrated `PolicyEngine` and `ApprovalManager` for safe tool execution with audit trails.
+*   **⚡ Modern Async/Streaming**: First-class support for `ainvoke` and event-based streaming (`astream`).
+*   **🔍 Observability**: Structured logging and token tracking out of the box.
 
+---
+
+## 🚀 Quick Start
+
+### 1. Installation
 ```bash
 pip install litellm-adk
 ```
 
-## Quick Start
-
-### Simple Conversational Agent
-
+### 2. Basic Agent with Tools
 ```python
-from litellm_adk.agents import LiteLLMAgent
-from litellm_adk.memory import FileMemory
+import asyncio
+from litellm_adk import LiteLLMAgent, tool, FileMemory
 
-# Setup persistent memory
-memory = FileMemory("chat_history.json")
-
-agent = LiteLLMAgent(
-    model="gpt-4", 
-    memory=memory,
-    session_id="user-123"
-)
-
-response = agent.invoke("My name is Alice.")
-print(agent.invoke("What is my name?")) # Alice
-```
-
-### Registering Tools
-
-```python
-from litellm_adk.tools import tool
-
+# Define a tool with zero boilerplate
 @tool
-def get_weather(location: str):
-    """Get the current weather for a location."""
-    return f"The weather in {location} is sunny."
+def get_stock_price(symbol: str):
+    """Fetches the current stock price."""
+    return {"symbol": symbol, "price": 150.0}
 
-agent = LiteLLMAgent(tools=[get_weather])
-agent.invoke("What is the weather in London?")
+async def main():
+    # Initialize with persistent file memory
+    agent = LiteLLMAgent(
+        model="oci/xai.grok-3",
+        tools=[get_stock_price],
+        memory=FileMemory("history.json")
+    )
+    
+    response = await agent.ainvoke("What is the price of AAPL?")
+    print(f"Agent: {response}")
+    await agent.aclose()
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-## Configuration
+---
 
-The ADK uses `pydantic-settings`. Configure via `.env`:
+## 📊 High-Performance Database Agents
 
-- `ADK_MODEL`: Default model (e.g., `gpt-4o`).
-- `ADK_API_KEY`: Default API key.
-- `ADK_BASE_URL`: Global base URL override.
-- `ADK_LOG_LEVEL`: DEBUG, INFO, etc.
+The ADK specializes in **NL2SQL** via the `DatabaseAgent`. It supports "Blind Summarization" for security—allowing the agent to talk about data without leaking PII into model logs.
 
-## Documentation
-- [Example: Basic Tools](./examples/demo.py)
-- [Example: Persistent Memory](./examples/memory_demo.py)
+```python
+from litellm_adk import DatabaseAgent
 
-## License
+agent = DatabaseAgent(
+    db_url="mysql+pymysql://user:pass@localhost/analytics",
+    model="gpt-4o",
+    return_direct=True # Privacy: Summary to LLM, full data to your UI
+)
+```
 
-MIT
+---
+
+## 📖 Documentation
+
+Dive deeper into the components:
+
+*   [🤖 **Agent Core**](./docs/AGENT.md): Logic, streaming, and failover.
+*   [📊 **Database Integration**](./docs/DATABASE_AGENT.md): SQL, MySQL, and MongoDB.
+*   [🧠 **Memory & Persistence**](./docs/MEMORY.md): Storing state and history.
+*   [🛠️ **Tools & HITL**](./docs/TOOLS.md): Custom tools and Human-in-the-Loop policies.
+
+---
+
+## 🏗️ Project Structure
+
+*   `core/`: Abstract base classes (Agent, Memory, Adapter).
+*   `integrations/`: Specific implementations (MySQL, MongoDB, ChromaDB).
+*   `session/`: State management for multi-user chat.
+*   `observability/`: Logging and telemetry.
+
+---
+
+## 📜 License
+
+MIT © 2026 Aarumugapandi
